@@ -32,7 +32,6 @@ jobs:
         run: |
           chown -R user:user $PWD
           sudo -u user bash -c "
-            cd dxvk
             echo $PWD
             export CFLAGS="-flto=auto -O2 -march=nocona -mtune=nocona -mno-avx -mfpmath=sse"
             export CXXFLAGS="-flto=auto -O2 -march=nocona -mtune=nocona -mno-avx -mfpmath=sse"
