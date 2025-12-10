@@ -33,10 +33,12 @@ jobs:
           chown -R user:user $PWD
           sudo -u user bash -c "
             echo $PWD
-            export CFLAGS='-flto=auto -O2 -march=nocona -mtune=nocona -mno-avx -mfpmath=sse'
-            export CXXFLAGS='-flto=auto -O2 -march=nocona -mtune=nocona -mno-avx -mfpmath=sse'
+            export CFLAGS='-flto=thin -O2 -march=znver3 -mtune=znver3 -mno-avx -mno-avx2 -mfpmath=sse'
+            export CXXFLAGS='-flto=thin -O2 -march=znver3 -mtune=znver3 -mno-avx -mno-avx2 -mfpmath=sse'
             export LDFLAGS='-Wl,-O2 -Wl,--sort-common -Wl,--as-needed'
-            meson setup build --cross-file "build-win64.txt" --buildtype release --prefix /tmp/binaries --strip -Denable_d3d8=true --wipe
+            meson setup build --cross-file "build-win64.txt" --buildtype release --prefix /tmp/binaries/x64 --strip -Denable_d3d8=true --wipe
+            ninja -C build install
+            meson setup build --cross-file "build-win32.txt" --buildtype release --prefix /tmp/binaries/x32 --strip -Denable_d3d8=true --wipe
             ninja -C build install
           "
 
