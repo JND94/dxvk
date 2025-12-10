@@ -1,4 +1,4 @@
-name: DXVK
+name: DXVK BUILD
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
 
-      steps:
+    steps:
       - name: Checkout code
         id: checkout-code
         uses: actions/checkout@v4
