@@ -117,6 +117,9 @@ namespace dxvk {
           uint32_t                regIndex) {
       DxvkShaderBinding binding(m_stage, setIndexForType(type), regIndex);
 
+      if (regSpace == DxvkIrShader::SpecDataSet)
+        binding = DxvkShaderBinding(m_stage, regSpace, regIndex);
+
       if (m_bindings) {
         auto dstBinding = m_bindings->mapBinding(binding);
 
@@ -184,7 +187,8 @@ namespace dxvk {
     : m_builder (builder),
       m_shader  (shader),
       m_info    (info) {
-
+      if (m_info.options.flags.test(DxvkShaderCompileFlag::EnableSampleRateShading))
+        m_metadata.flags.set(DxvkShaderFlag::HasSampleRateShading);
     }
 
     /**
@@ -192,6 +196,7 @@ namespace dxvk {
      */
     void run() {
       gatherAliasedResourceBindings();
+      removeUnusedPushDataDwords();
 
       auto iter = m_builder.begin();
 
@@ -245,13 +250,28 @@ namespace dxvk {
             iter = handleSpecConstant(iter);
           } break;
 
+          case dxbc_spv::ir::OpCode::eSetGsInputPrimitive: {
+            iter = handleInputTopology(iter);
+          } break;
+
+          case dxbc_spv::ir::OpCode::eSetGsOutputPrimitive:
+          case dxbc_spv::ir::OpCode::eSetTessDomain: {
+            iter = handleOutputTopology(iter);
+          } break;
+
+          case dxbc_spv::ir::OpCode::eSetTessPrimitive: {
+            iter = handleTessPrimitive(iter);
+          } break;
+
           default:
             ++iter;
         }
       }
 
       rewriteSamplers();
+      rewriteConstantBuffers();
       rewriteUavCounters();
+      rewritePushData();
 
       if (m_sharedPushDataOffset) {
         auto stageMask = (m_metadata.stage & VK_SHADER_STAGE_ALL_GRAPHICS)
@@ -274,6 +294,9 @@ namespace dxvk {
         rasterizedStream = m_info.rasterizedStream;
 
       m_metadata.outputs = convertIoMap(dxbc_spv::ir::IoMap::forOutputs(m_builder, uint32_t(rasterizedStream)));
+
+      if (m_info.options.flags.test(DxvkShaderCompileFlag::SemanticIo))
+        m_metadata.flags.set(DxvkShaderFlag::SemanticIo);
     }
 
 
@@ -294,6 +317,10 @@ namespace dxvk {
     }
 
   private:
+
+    struct CbvInfo {
+      dxbc_spv::ir::SsaDef cbv = { };
+    };
 
     struct SamplerInfo {
       dxbc_spv::ir::SsaDef sampler = { };
@@ -334,6 +361,17 @@ namespace dxvk {
       bool hasBinding = false;
     };
 
+    struct PushDataDwordEntry {
+      uint16_t member;
+      uint8_t bitIndex;
+      uint8_t bitCount;
+    };
+
+    struct PushDataDwordMap {
+      std::string debugName;
+      std::array<PushDataDwordEntry, 4u> components;
+    };
+
     dxbc_spv::ir::Builder&        m_builder;
     const DxvkIrShaderConverter&  m_shader;
     DxvkIrShaderCreateInfo        m_info = { };
@@ -347,12 +385,15 @@ namespace dxvk {
     dxbc_spv::ir::SsaDef          m_incUavCounterFunction = { };
     dxbc_spv::ir::SsaDef          m_decUavCounterFunction = { };
 
+    dxbc_spv::ir::SsaDef          m_builtInPushData = { };
+
     uint32_t                      m_localPushDataAlign = 4u;
     uint32_t                      m_localPushDataOffset = 0u;
     uint32_t                      m_localPushDataResourceMask = 0u;
 
     uint32_t                      m_sharedPushDataOffset = 0u;
 
+    small_vector<CbvInfo,         16u>  m_cbv;
     small_vector<SamplerInfo,     16u>  m_samplers;
     small_vector<UavCounterInfo,  64u>  m_uavCounters;
 
@@ -459,25 +500,8 @@ namespace dxvk {
 
 
     dxbc_spv::ir::Builder::iterator handleCbv(dxbc_spv::ir::Builder::iterator op) {
-      auto regSpace = uint32_t(op->getOperand(1u));
-      auto regIndex = uint32_t(op->getOperand(2u));
-      auto regCount = uint32_t(op->getOperand(3u));
-
-      DxvkBindingInfo binding = { };
-      binding.set = DxvkShaderResourceMapping::setIndexForType(dxbc_spv::ir::ScalarType::eCbv);
-      binding.binding = regIndex;
-      binding.resourceIndex = m_shader.determineResourceIndex(m_stage,
-        dxbc_spv::ir::ScalarType::eCbv, regSpace, regIndex);
-      binding.descriptorType = determineDescriptorType(*op);
-      binding.descriptorCount = regCount;
-      binding.access = VK_ACCESS_UNIFORM_READ_BIT;
-
-      if (binding.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
-        binding.access = VK_ACCESS_SHADER_READ_BIT;
-
-      binding.flags.set(DxvkDescriptorFlag::UniformBuffer);
-
-      addBinding(binding);
+      auto& e = m_cbv.emplace_back();
+      e.cbv = op->getDef();
       return ++op;
     }
 
@@ -576,8 +600,12 @@ namespace dxvk {
 
 
     dxbc_spv::ir::Builder::iterator handleUserInput(dxbc_spv::ir::Builder::iterator op) {
-      if (m_stage == dxbc_spv::ir::ShaderStage::ePixel)
+      if (m_stage == dxbc_spv::ir::ShaderStage::ePixel) {
         handleInputInterpolation(op);
+
+        auto locationMask = 1u << uint32_t(op->getOperand(op->getFirstLiteralOperandIndex()));
+        m_metadata.flatShadingInputs |= m_info.flatShadingInputs & locationMask;
+      }
 
       return ++op;
     }
@@ -589,11 +617,18 @@ namespace dxvk {
 
       auto builtIn = dxbc_spv::ir::BuiltIn(op->getOperand(op->getFirstLiteralOperandIndex()));
 
-      if (builtIn == dxbc_spv::ir::BuiltIn::eSampleCount)
-        return rewriteSampleCountBuiltIn(op);
+      switch (builtIn) {
+        case dxbc_spv::ir::BuiltIn::eIsFullyCovered: {
+          m_metadata.flags.set(DxvkShaderFlag::UsesFragmentCoverage);
+        } break;
 
-      if (builtIn == dxbc_spv::ir::BuiltIn::eIsFullyCovered)
-        m_metadata.flags.set(DxvkShaderFlag::UsesFragmentCoverage);
+        case dxbc_spv::ir::BuiltIn::eSampleMask: {
+          m_metadata.flags.set(DxvkShaderFlag::UsesSampleMask);
+        } break;
+
+        default:
+          break;
+      }
 
       return ++op;
     }
@@ -607,10 +642,12 @@ namespace dxvk {
           m_metadata.flags.set(DxvkShaderFlag::ExportsPosition);
         } break;
 
-        case dxbc_spv::ir::BuiltIn::eLayerIndex:
+        case dxbc_spv::ir::BuiltIn::eLayerIndex: {
+          m_metadata.flags.set(DxvkShaderFlag::ExportsLayer);
+        } break;
+
         case dxbc_spv::ir::BuiltIn::eViewportIndex: {
-          if (m_stage != dxbc_spv::ir::ShaderStage::eGeometry)
-            m_metadata.flags.set(DxvkShaderFlag::ExportsViewportIndexLayerFromVertexStage);
+          m_metadata.flags.set(DxvkShaderFlag::ExportsViewport);
         } break;
 
         case dxbc_spv::ir::BuiltIn::eSampleMask: {
@@ -646,6 +683,78 @@ namespace dxvk {
     dxbc_spv::ir::Builder::iterator handleSpecConstant(dxbc_spv::ir::Builder::iterator op) {
       auto specId = uint32_t(op->getOperand(op->getFirstLiteralOperandIndex()));
       m_metadata.specConstantMask |= 1u << specId;
+      return ++op;
+    }
+
+
+    dxbc_spv::ir::Builder::iterator handleInputTopology(dxbc_spv::ir::Builder::iterator op) {
+      auto type = dxbc_spv::ir::PrimitiveType(op->getOperand(1u));
+
+      switch (type) {
+        case dxbc_spv::ir::PrimitiveType::ePoints: {
+          m_metadata.inputTopology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+        } break;
+
+        case dxbc_spv::ir::PrimitiveType::eLines: {
+          m_metadata.inputTopology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+        } break;
+
+        case dxbc_spv::ir::PrimitiveType::eLinesAdj: {
+          m_metadata.inputTopology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
+        } break;
+
+        case dxbc_spv::ir::PrimitiveType::eTriangles: {
+          m_metadata.inputTopology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        } break;
+
+        case dxbc_spv::ir::PrimitiveType::eTrianglesAdj: {
+          m_metadata.inputTopology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+        } break;
+
+        case dxbc_spv::ir::PrimitiveType::eQuads:
+        case dxbc_spv::ir::PrimitiveType::ePatch: {
+          Logger::err(str::format("Unhandled input topology: ", type));
+        } break;
+      }
+
+      return ++op;
+    }
+
+
+    dxbc_spv::ir::Builder::iterator handleOutputTopology(dxbc_spv::ir::Builder::iterator op) {
+      auto type = dxbc_spv::ir::PrimitiveType(op->getOperand(1u));
+
+      switch (type) {
+        case dxbc_spv::ir::PrimitiveType::ePoints: {
+          m_metadata.outputTopology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+        } break;
+
+        case dxbc_spv::ir::PrimitiveType::eLines: {
+          m_metadata.outputTopology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+        } break;
+
+        case dxbc_spv::ir::PrimitiveType::eTriangles:
+        case dxbc_spv::ir::PrimitiveType::eQuads: {
+          m_metadata.outputTopology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        } break;
+
+        case dxbc_spv::ir::PrimitiveType::eLinesAdj:
+        case dxbc_spv::ir::PrimitiveType::eTrianglesAdj:
+        case dxbc_spv::ir::PrimitiveType::ePatch: {
+          Logger::err(str::format("Unhandled output topology: ", type));
+        } break;
+      }
+
+      return ++op;
+    }
+
+
+    dxbc_spv::ir::Builder::iterator handleTessPrimitive(dxbc_spv::ir::Builder::iterator op) {
+      auto type = dxbc_spv::ir::PrimitiveType(op->getOperand(1u));
+
+      if (type == dxbc_spv::ir::PrimitiveType::ePoints)
+        m_metadata.flags.set(DxvkShaderFlag::TessellationPoints);
+
       return ++op;
     }
 
@@ -702,18 +811,12 @@ namespace dxvk {
 
       m_localPushDataResourceMask |= ((1ull << dwordCount) - 1ull) << dwordIndex;
 
-      if (m_info.options.flags.test(DxvkShaderCompileFlag::Supports16BitPushData)) {
-        // Add each word separately and pad with a dummy entry if unaligned
-        for (uint32_t i = 0u; i < wordCount; i++)
-          pushDataType.addStructMember(dxbc_spv::ir::ScalarType::eU16);
+      // Add each word separately and pad with a dummy entry if unaligned
+      for (uint32_t i = 0u; i < wordCount; i++)
+        pushDataType.addStructMember(dxbc_spv::ir::ScalarType::eU16);
 
-        if (wordCount & 1u)
-          pushDataType.addStructMember(dxbc_spv::ir::ScalarType::eU16);
-      } else {
-        // Add dword member for each pair fo samplers
-        for (uint32_t i = 0u; i < dwordCount; i++)
-          pushDataType.addStructMember(dxbc_spv::ir::ScalarType::eU32);
-      }
+      if (wordCount & 1u)
+        pushDataType.addStructMember(dxbc_spv::ir::ScalarType::eU16);
 
       // Declare actual push data structure
       auto def = m_builder.add(dxbc_spv::ir::Op::DclPushData(
@@ -722,77 +825,161 @@ namespace dxvk {
       m_localPushDataOffset += pushDataType.byteSize();
 
       // Add debug names for sampler indices
-      for (const auto& e : m_samplers) {
-        if (m_info.options.flags.test(DxvkShaderCompileFlag::Supports16BitPushData)) {
-          addDebugMemberName(def, e.samplerIndex, getDebugName(e.sampler));
-        } else if (!(e.samplerIndex % 2u)) {
-          std::string debugName = getDebugName(e.sampler);
+      for (const auto& e : m_samplers)
+        addDebugMemberName(def, e.samplerIndex, getDebugName(e.sampler));
 
-          for (const auto& eHi : m_samplers) {
-            if (eHi.samplerIndex == e.samplerIndex + 1u) {
-              debugName += "_";
-              debugName += getDebugName(eHi.sampler);
-              break;
-            }
-          }
-
-          addDebugMemberName(def, e.samplerIndex / 2u, debugName);
-        }
-      }
+      if (wordCount & 1u)
+        addDebugMemberName(def, wordCount, "sPad");
 
       return def;
     }
 
 
-    dxbc_spv::ir::Builder::iterator rewriteSampleCountBuiltIn(dxbc_spv::ir::Builder::iterator op) {
-      small_vector<dxbc_spv::ir::SsaDef, 64u> uses;
-      m_builder.getUses(op->getDef(), uses);
+    dxbc_spv::ir::SsaDef defineBuiltInPushData() {
+      if (!m_builtInPushData) {
+        dxbc_spv::ir::Type pushDataType = { };
 
-      m_builder.rewriteOp(op->getDef(), dxbc_spv::ir::Op::DclPushData(op->getType(),
-        m_entryPoint, m_info.options.sampleCountPushDataOffset, dxbc_spv::ir::ShaderStageMask()));
+        m_builtInPushData = m_builder.add(dxbc_spv::ir::Op::DclPushData(dxbc_spv::ir::ScalarType::eU32,
+          m_entryPoint, m_info.options.builtInPushDataOffset, dxbc_spv::ir::ShaderStageMask()));
+
+        m_builder.add(dxbc_spv::ir::Op::DebugName(m_builtInPushData, "builtins"));
+
+        m_sharedPushDataOffset = std::max<uint32_t>(m_sharedPushDataOffset,
+          m_info.options.builtInPushDataOffset + sizeof(uint32_t));
+      }
+
+      return m_builtInPushData;
+    }
+
+
+    void rewriteCbvUseAsBda(const dxbc_spv::ir::Op& cbv, const dxbc_spv::ir::Type& type, const dxbc_spv::ir::Op& use) {
+      // Replace descriptor load with push data load and pointer instruction
+      auto load = m_builder.addBefore(use.getDef(), dxbc_spv::ir::Op::PushDataLoad(
+        dxbc_spv::ir::ScalarType::eU64, cbv.getDef(), dxbc_spv::ir::SsaDef()));
+
+      m_builder.rewriteOp(use.getDef(), dxbc_spv::ir::Op::Pointer(
+        type, load, dxbc_spv::ir::UavFlag::eReadOnly));
+
+      // Replace all buffer loads with memory loads
+      small_vector<dxbc_spv::ir::SsaDef, 256u> uses;
+      m_builder.getUses(use.getDef(), uses);
 
       for (auto use : uses) {
         const auto& useOp = m_builder.getOp(use);
 
-        if (useOp.getOpCode() == dxbc_spv::ir::OpCode::eInputLoad) {
-          m_builder.rewriteOp(useOp.getDef(), dxbc_spv::ir::Op::PushDataLoad(
-            useOp.getType(), op->getDef(), dxbc_spv::ir::SsaDef()));
+        if (useOp.getOpCode() == dxbc_spv::ir::OpCode::eBufferLoad) {
+          dxbc_spv::ir::Op newOp(dxbc_spv::ir::OpCode::eMemoryLoad, useOp.getType());
+
+          for (uint32_t i = 0u; i < useOp.getOperandCount(); i++)
+            newOp.addOperand(useOp.getOperand(i));
+
+          newOp.setFlags(useOp.getFlags());
+          m_builder.rewriteOp(use, std::move(newOp));
         }
       }
+    }
 
-      m_sharedPushDataOffset = std::max<uint32_t>(m_sharedPushDataOffset,
-        m_info.options.sampleCountPushDataOffset + sizeof(uint32_t));
-      return ++op;
+
+    void rewriteCbvAsBda(const dxbc_spv::ir::Op& cbv, uint32_t pushDataOffset) {
+      // Replace all descriptor loads with a push data load and conversion to
+      // pointer, and in turn replace all buffer loads with raw memory loads
+      small_vector<dxbc_spv::ir::SsaDef, 16u> uses;
+      m_builder.getUses(cbv.getDef(), uses);
+
+      // Rewrite CBV declaration as a 64-bit push data declaration.
+      // Keeps the debug name intact.
+      auto cbvType = cbv.getType();
+      auto entryPoint = dxbc_spv::ir::SsaDef(cbv.getOperand(0u));
+
+      m_builder.rewriteOp(cbv.getDef(), dxbc_spv::ir::Op::DclPushData(
+        dxbc_spv::ir::ScalarType::eU64, entryPoint, pushDataOffset, m_stage));
+
+      for (auto use : uses) {
+        const auto& useOp = m_builder.getOp(use);
+
+        switch (useOp.getOpCode()) {
+          case dxbc_spv::ir::OpCode::eDescriptorLoad: {
+            rewriteCbvUseAsBda(cbv, cbvType, useOp);
+          } break;
+
+          case dxbc_spv::ir::OpCode::eDebugName:
+            break;
+
+          case dxbc_spv::ir::OpCode::eDebugMemberName: {
+            // Can't do much with member names here
+            m_builder.remove(use);
+          } break;
+
+          default:
+            dxbc_spv_unreachable();
+            break;
+        }
+      }
+    }
+
+
+    void rewriteConstantBuffers() {
+      for (const auto& e : m_cbv) {
+        const auto& op = m_builder.getOp(e.cbv);
+
+        auto regSpace = uint32_t(op.getOperand(1u));
+        auto regIndex = uint32_t(op.getOperand(2u));
+        auto regCount = uint32_t(op.getOperand(3u));
+
+        DxvkBindingInfo binding = { };
+        binding.set = DxvkShaderResourceMapping::setIndexForType(dxbc_spv::ir::ScalarType::eCbv);
+        binding.binding = regIndex;
+        binding.resourceIndex = m_shader.determineResourceIndex(m_stage,
+          dxbc_spv::ir::ScalarType::eCbv, regSpace, regIndex);
+        binding.descriptorType = determineDescriptorType(op);
+        binding.descriptorCount = regCount;
+        binding.access = VK_ACCESS_UNIFORM_READ_BIT;
+
+        if (binding.descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+          binding.access = VK_ACCESS_SHADER_READ_BIT;
+
+        binding.flags.set(DxvkDescriptorFlag::UniformBuffer);
+
+        // If we can use BDA or push address mapping with at least the same
+        // level of performance as a constant buffer, rewrite the binding.
+        uint32_t maxPushDataSize = DxvkPushDataBlock::computeBlockSizeForStage(convertShaderStage(m_stage));
+
+        bool useHeap = m_info.options.spirv.test(DxvkShaderSpirvFlag::SupportsDescriptorHeap);
+        bool useBda = m_info.options.flags.test(DxvkShaderCompileFlag::LowerInBoundsCbvToBda);
+
+        if ((useHeap || useBda) && (op.getFlags() & dxbc_spv::ir::OpFlag::eInBounds)
+         && (m_localPushDataOffset + sizeof(uint64_t) <= maxPushDataSize)) {
+          m_localPushDataAlign = std::max<uint32_t>(m_localPushDataAlign, sizeof(uint64_t));
+          m_localPushDataOffset = align(m_localPushDataOffset, m_localPushDataAlign);
+
+          binding.blockOffset = MaxSharedPushDataSize + m_localPushDataOffset;
+          binding.flags.set(DxvkDescriptorFlag::PushData);
+
+          if (!useHeap)
+            rewriteCbvAsBda(op, m_localPushDataOffset);
+
+          m_localPushDataResourceMask |= 0x3ull << (m_localPushDataOffset / sizeof(uint32_t));
+          m_localPushDataOffset += sizeof(uint64_t);
+        }
+
+        addBinding(binding);
+      }
     }
 
 
     dxbc_spv::ir::SsaDef loadConstantSamplerIndex(dxbc_spv::ir::SsaDef ref, dxbc_spv::ir::SsaDef pushDataDef, const SamplerInfo& info, uint32_t index) {
       uint32_t wordIndex = info.samplerIndex + index;
 
-      if (m_info.options.flags.test(DxvkShaderCompileFlag::Supports16BitPushData)) {
-        dxbc_spv::ir::SsaDef memberIndex = { };
+      dxbc_spv::ir::SsaDef memberIndex = { };
 
-        if (m_builder.getOp(pushDataDef).getType().isStructType())
-          memberIndex = m_builder.makeConstant(wordIndex);
+      if (m_builder.getOp(pushDataDef).getType().isStructType())
+        memberIndex = m_builder.makeConstant(wordIndex);
 
-        dxbc_spv::ir::SsaDef samplerIndex = m_builder.addBefore(ref,
-          dxbc_spv::ir::Op::PushDataLoad(dxbc_spv::ir::ScalarType::eU16, pushDataDef, memberIndex));
-        samplerIndex = m_builder.addBefore(ref, dxbc_spv::ir::Op::ConvertItoI(
-          dxbc_spv::ir::ScalarType::eU32, samplerIndex));
-        return samplerIndex;
-      } else {
-        dxbc_spv::ir::SsaDef bitIndex = m_builder.makeConstant(uint32_t(16u * (wordIndex % 2u)));
-        dxbc_spv::ir::SsaDef memberIndex = { };
-
-        if (m_builder.getOp(pushDataDef).getType().isStructType())
-          memberIndex = m_builder.makeConstant(uint32_t(wordIndex / 2u));
-
-        dxbc_spv::ir::SsaDef samplerIndex = m_builder.addBefore(ref,
-          dxbc_spv::ir::Op::PushDataLoad(dxbc_spv::ir::ScalarType::eU32, pushDataDef, memberIndex));
-        samplerIndex = m_builder.addBefore(ref, dxbc_spv::ir::Op::UBitExtract(
-          dxbc_spv::ir::ScalarType::eU32, samplerIndex, bitIndex, m_builder.makeConstant(16u)));
-        return samplerIndex;
-      }
+      dxbc_spv::ir::SsaDef samplerIndex = m_builder.addBefore(ref,
+        dxbc_spv::ir::Op::PushDataLoad(dxbc_spv::ir::ScalarType::eU16, pushDataDef, memberIndex));
+      samplerIndex = m_builder.addBefore(ref, dxbc_spv::ir::Op::ConvertItoI(
+        dxbc_spv::ir::ScalarType::eU32, samplerIndex));
+      return samplerIndex;
     }
 
 
@@ -1053,11 +1240,8 @@ namespace dxvk {
       // In compute shaders, we can freely use push data space
       auto ssboAlignment = m_info.options.minStorageBufferAlignment;
 
-      size_t maxPushDataSize = m_stage == dxbc_spv::ir::ShaderStage::eCompute
-        ? MaxTotalPushDataSize - MaxReservedPushDataSize
-        : MaxPerStagePushDataSize;
-
-      size_t uavCounterIndex = 0u;
+      uint32_t maxPushDataSize = DxvkPushDataBlock::computeBlockSizeForStage(convertShaderStage(m_stage));
+      uint32_t uavCounterIndex = 0u;
 
       if (m_localPushDataOffset + sizeof(uint64_t) <= maxPushDataSize && ssboAlignment <= 4u && !hasUavCounterArray()) {
         // Align push data to a multiple of 8 bytes before emitting counters
@@ -1067,7 +1251,7 @@ namespace dxvk {
         // Declare push data variable and type
         dxbc_spv::ir::Type pushDataType = { };
 
-        size_t maxUavCounters = std::min<size_t>(m_uavCounters.size(),
+        uint32_t maxUavCounters = std::min<uint32_t>(m_uavCounters.size(),
           (maxPushDataSize - m_localPushDataOffset) / sizeof(uint64_t));
 
         for (uint32_t i = 0u; i < maxUavCounters; i++)
@@ -1122,6 +1306,322 @@ namespace dxvk {
 
         addBinding(binding);
       }
+    }
+
+
+    bool typeHasSubDwordMember(const dxbc_spv::ir::Type& type) {
+      for (uint32_t i = 0u; i < type.getStructMemberCount(); i++) {
+        if (byteSize(type.getBaseType(i).getBaseType()) < sizeof(uint32_t))
+          return true;
+      }
+
+      return false;
+    }
+
+
+    void lowerSubDwordPushData(dxbc_spv::ir::SsaDef pushDataDef) {
+      auto pushDataOp = m_builder.getOp(pushDataDef);
+      const auto& pushDataType = pushDataOp.getType();
+
+      if (!typeHasSubDwordMember(pushDataType))
+        return;
+
+      // Build new type and a look-up table to re-map members
+      small_vector<PushDataDwordMap, 64u> map;
+
+      dxbc_spv::ir::Type newType = {};
+
+      for (uint32_t i = 0u; i < pushDataType.getStructMemberCount(); i++) {
+        auto member = pushDataType.getBaseType(i);
+        auto scalarSize = byteSize(member.getBaseType());
+
+        if (scalarSize < sizeof(uint32_t)) {
+          // We enforce scalar alignment everywhere, so remapping sub-dword
+          // members is simple: If the offset is divisible by 4, we need to
+          // add a new dword, otherwise map it to bits of an existing one.
+          auto& entry = map.emplace_back();
+
+          for (uint32_t j = 0u; j < member.getVectorSize(); j++) {
+            uint32_t offset = pushDataType.byteOffset(i) + j * scalarSize;
+
+            if (!(offset % sizeof(uint32_t)))
+              newType.addStructMember(dxbc_spv::ir::ScalarType::eU32);
+
+            entry.components[j].member = newType.getStructMemberCount() - 1u;
+            entry.components[j].bitIndex = 8u * (offset % sizeof(uint32_t));
+            entry.components[j].bitCount = 8u * scalarSize;
+          }
+        } else {
+          // Add member as-is, but we still need to re-map the index. Leave
+          // bit count at 0 since this is not a dword entry.
+          uint32_t newIndex = newType.getStructMemberCount();
+          newType.addStructMember(member);
+
+          auto& entry = map.emplace_back();
+
+          for (uint32_t i = 0u; i < member.getVectorSize(); i++)
+            entry.components[i].member = newIndex;
+        }
+      }
+
+      // Rewrite loads and collect debug names since we'll need to re-emit
+      // those with appropriately remapped member indices and packing.
+      small_vector<dxbc_spv::ir::SsaDef, 256u> uses;
+      m_builder.getUses(pushDataDef, uses);
+
+      for (auto use : uses) {
+        auto useOp = m_builder.getOp(use);
+
+        switch (useOp.getOpCode()) {
+          case dxbc_spv::ir::OpCode::ePushDataLoad: {
+            dxbc_spv_assert(useOp.getType().isBasicType());
+            auto type = useOp.getType().getBaseType(0u);
+
+            auto addressOp = m_builder.getOpForOperand(useOp, 1u);
+            dxbc_spv_assert(!addressOp || addressOp.isConstant());
+
+            uint32_t addressComponent = 0u;
+            uint32_t memberIndex = 0u;
+
+            if (pushDataType.isStructType() && addressComponent < addressOp.getOperandCount())
+              memberIndex = uint32_t(addressOp.getOperand(addressComponent++));
+
+            dxbc_spv_assert(memberIndex < map.size());
+
+            if (byteSize(type.getBaseType()) < sizeof(uint32_t)) {
+              // Work out which component(s) to load
+              uint32_t componentIndex = 0u;
+              uint32_t componentCount = type.getVectorSize();
+
+              if (addressComponent < addressOp.getOperandCount())
+                componentIndex = uint32_t(addressOp.getOperand(addressComponent++));
+
+              // Process vectors one component at a time since components
+              // may straddle multiple different dwords.
+              dxbc_spv::ir::Op compositeOp(dxbc_spv::ir::OpCode::eCompositeConstruct, type);
+
+              for (uint32_t i = componentIndex; i < componentIndex + componentCount; i++) {
+                auto& info = map[memberIndex].components[i];
+
+                dxbc_spv::ir::SsaDef memberAddr = {};
+
+                if (newType.isStructType())
+                  memberAddr = m_builder.makeConstant(uint32_t(info.member));
+
+                dxbc_spv_assert(newType.getBaseType(info.member) == dxbc_spv::ir::ScalarType::eU32);
+
+                auto dw = m_builder.addBefore(use, dxbc_spv::ir::Op::PushDataLoad(
+                  dxbc_spv::ir::ScalarType::eU32, pushDataDef, memberAddr));
+
+                dw = m_builder.addBefore(use, dxbc_spv::ir::Op::UBitExtract(
+                  dxbc_spv::ir::ScalarType::eU32, dw,
+                  m_builder.makeConstant(uint32_t(info.bitIndex)),
+                  m_builder.makeConstant(uint32_t(info.bitCount))));
+
+                auto smallType = byteSize(type.getBaseType()) > 1u
+                  ? dxbc_spv::ir::ScalarType::eU16
+                  : dxbc_spv::ir::ScalarType::eU8;
+
+                dw = m_builder.addBefore(use, dxbc_spv::ir::Op::ConvertItoI(smallType, dw));
+
+                if (type.getBaseType() != smallType)
+                  dw = m_builder.addBefore(use, dxbc_spv::ir::Op::Cast(type.getBaseType(), dw));
+
+                compositeOp.addOperand(dw);
+              }
+
+              // Replace the original push data load with the new sequence of instructions.
+              auto result = dxbc_spv::ir::SsaDef(compositeOp.getOperand(0u));
+
+              if (type.isVector())
+                result = m_builder.addBefore(use, std::move(compositeOp));
+
+              m_builder.rewriteDef(use, result);
+            } else  {
+              // We forward any non-subdword member as-is, so the struct-ness of the
+              // push data block cannot have changed if we have at least one of these.
+              dxbc_spv_assert(newType.isStructType() == pushDataType.isStructType());
+
+              // Adjust member index, but otherwise forward load as-is.
+              if (newType.isStructType())
+                addressOp.setOperand(0u, map[memberIndex].components[0].member);
+
+              m_builder.rewriteOp(use, useOp.setOperand(1u, m_builder.add(std::move(addressOp))));
+            }
+          } break;
+
+          case dxbc_spv::ir::OpCode::eDebugName: {
+            if (!pushDataType.isStructType() && !map.empty())
+              map[0].debugName = useOp.getLiteralString(1u);
+
+            if (!newType.isStructType())
+              m_builder.remove(use);
+          } break;
+
+          case dxbc_spv::ir::OpCode::eDebugMemberName: {
+            uint32_t member = uint32_t(useOp.getOperand(1u));
+
+            if (member < map.size())
+              map[member].debugName = useOp.getLiteralString(2u);
+
+            m_builder.remove(use);
+          } break;
+
+          default:
+            dxbc_spv_unreachable();
+        }
+      }
+
+      // Fuse debug names of merged members
+      small_vector<std::string, 64u> debugNames(newType.getStructMemberCount());
+
+      for (uint32_t i = 0u; i < map.size(); i++) {
+        auto type = pushDataType.getBaseType(i);
+
+        if (map[i].debugName.empty())
+          continue;
+
+        static const char* swizzle = "xyzw";
+
+        bool straddles = map[i].components[0].member != map[i].components[type.getVectorSize() - 1u].member;
+
+        uint32_t lastMember = -1u;
+
+        for (uint32_t j = 0u; j < type.getVectorSize(); j++) {
+          uint32_t member = map[i].components[j].member;
+
+          if (lastMember != member) {
+            lastMember = member;
+
+            if (!debugNames[member].empty())
+              debugNames[member] += '_';
+
+            debugNames[member] += map[i].debugName;
+
+            if (straddles)
+              debugNames[member] += '.';
+          }
+
+          if (straddles)
+            debugNames[member] += swizzle[j];
+        }
+      }
+
+      for (uint32_t i = 0u; i < debugNames.size(); i++) {
+        if (!debugNames[i].empty()) {
+          if (newType.isStructType())
+            m_builder.add(dxbc_spv::ir::Op::DebugMemberName(pushDataDef, i, debugNames[i].c_str()));
+          else
+            m_builder.add(dxbc_spv::ir::Op::DebugName(pushDataDef, debugNames[i].c_str()));
+        }
+      }
+
+      // Rewrite declaration with new type
+      m_builder.rewriteOp(pushDataDef, pushDataOp.setType(std::move(newType)));
+    }
+
+
+    void rewritePushData() {
+      // Don't need to do anythig if the driver supports small types properly
+      if (m_info.options.flags.test(DxvkShaderCompileFlag::SupportsSubDwordPushData))
+        return;
+
+      small_vector<dxbc_spv::ir::SsaDef, 16u> pushData;
+
+      for (auto iter = m_builder.getDeclarations().first;
+                iter != m_builder.getDeclarations().second; iter++) {
+        if (iter->getOpCode() == dxbc_spv::ir::OpCode::eDclPushData)
+          pushData.push_back(iter->getDef());
+      }
+
+      for (auto e : pushData)
+        lowerSubDwordPushData(e);
+    }
+
+
+    void removeUnusedPushDataMembers(dxbc_spv::ir::SsaDef def) {
+      const auto& decl = m_builder.getOp(def);
+      const auto& type = decl.getType();
+
+      if (!type.isStructType())
+        return;
+
+      // Find the index of the highest accessed struct member
+      uint32_t maxAccessedMember = 0u;
+
+      small_vector<dxbc_spv::ir::SsaDef, 64u> uses;
+      m_builder.getUses(def, uses);
+
+      for (auto use : uses) {
+        const auto& useOp = m_builder.getOp(use);
+
+        if (useOp.getOpCode() == dxbc_spv::ir::OpCode::ePushDataLoad) {
+          const auto& addressOp = m_builder.getOpForOperand(useOp, 1u);
+          dxbc_spv_assert(addressOp.isConstant());
+
+          maxAccessedMember = std::max(maxAccessedMember,
+            uint32_t(addressOp.getOperand(0u)));
+        }
+      }
+
+      // Build new type, adding enough members to keep it aligned to a
+      // multiple of four bytes since we require dword alignment.
+      dxbc_spv::ir::Type newType;
+
+      for (uint32_t i = 0u; i < type.getStructMemberCount(); i++) {
+        if (i <= maxAccessedMember || (newType.byteSize() % 4u))
+          newType.addStructMember(type.getBaseType(i));
+      }
+
+      if (newType == decl.getType())
+        return;
+
+      for (auto use : uses) {
+        const auto& useOp = m_builder.getOp(use);
+
+        switch (useOp.getOpCode()) {
+          case dxbc_spv::ir::OpCode::ePushDataLoad: {
+            // If the new type is no longer a struct of multiple members,
+            // we have to remove the outer index from any loads.
+            if (!newType.isStructType()) {
+              const auto& addressOp = m_builder.getOpForOperand(useOp, 1u);
+              dxbc_spv_assert(addressOp.getOperandCount() <= 2u);
+
+              dxbc_spv::ir::SsaDef newAddress = (addressOp.getOperandCount() > 1u)
+                ? m_builder.makeConstant(uint32_t(addressOp.getOperand(1u)))
+                : dxbc_spv::ir::SsaDef();
+
+              m_builder.rewriteOp(use, dxbc_spv::ir::Op(useOp).setOperand(1u, newAddress));
+            }
+          } break;
+
+          case dxbc_spv::ir::OpCode::eDebugMemberName: {
+            // Remove any member debug names that are now out of bounds
+            if (uint32_t(useOp.getOperand(useOp.getFirstLiteralOperandIndex())) >= newType.getStructMemberCount())
+              m_builder.remove(use);
+          } break;
+
+          default:
+            break;
+        }
+      }
+
+      // Apply new type
+      m_builder.rewriteOp(def, dxbc_spv::ir::Op(decl).setType(std::move(newType)));
+    }
+
+
+    void removeUnusedPushDataDwords() {
+      small_vector<dxbc_spv::ir::SsaDef, 16u> pushData;
+
+      for (auto iter = m_builder.getDeclarations().first;
+                iter != m_builder.getDeclarations().second; iter++) {
+        if (iter->getOpCode() == dxbc_spv::ir::OpCode::eDclPushData)
+          pushData.push_back(iter->getDef());
+      }
+
+      for (auto e : pushData)
+        removeUnusedPushDataMembers(e);
     }
 
 
@@ -1327,9 +1827,15 @@ namespace dxvk {
           var.componentIndex = e.getFirstComponentIndex();
           var.componentCount = e.computeComponentCount();
           var.isPatchConstant = e.getType() == dxbc_spv::ir::IoEntryType::ePerPatch;
+
+          if (m_info.options.flags.test(DxvkShaderCompileFlag::SemanticIo)) {
+            auto semantic = io.getSemanticForEntry(e);
+            var.semanticName = semantic.name;
+            var.semanticIndex = semantic.index;
+          }
         }
 
-        map.add(var);
+        map.add(std::move(var));
       }
 
       return map;
@@ -1396,6 +1902,20 @@ namespace dxvk {
           return spv::BuiltInLocalInvocationIndex;
         case dxbc_spv::ir::BuiltIn::ePointSize:
           return spv::BuiltInPointSize;
+        case dxbc_spv::ir::BuiltIn::eTessFactorLimit:
+          return std::nullopt;
+        case dxbc_spv::ir::BuiltIn::ePointCoord:
+          return spv::BuiltInPointCoord;
+        case dxbc_spv::ir::BuiltIn::eLegacyAlphaTest:
+        case dxbc_spv::ir::BuiltIn::eLegacyFog:
+        case dxbc_spv::ir::BuiltIn::eLegacyClipPlanes:
+        case dxbc_spv::ir::BuiltIn::eLegacyPointArgs:
+        case dxbc_spv::ir::BuiltIn::eLegacySamplerState:
+        case dxbc_spv::ir::BuiltIn::eLegacyTextureStage:
+        case dxbc_spv::ir::BuiltIn::eLegacyConstFloat:
+        case dxbc_spv::ir::BuiltIn::eLegacyConstInt:
+        case dxbc_spv::ir::BuiltIn::eLegacyConstBool:
+          return std::nullopt;
       }
 
       return std::nullopt;
@@ -1521,17 +2041,20 @@ namespace dxvk {
 
     // Fix up shader I/O based on shader linkage
     { dxbc_spv::ir::LowerIoPass ioPass(irBuilder);
+      if (m_metadata.stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+        ioPass.resolveUnwrittenPsOutputs();
+
       if (linkage) {
-        if (m_metadata.stage == VK_SHADER_STAGE_FRAGMENT_BIT && linkage->fsFlatShading && m_info.flatShadingInputs)
-          ioPass.enableFlatInterpolation(m_info.flatShadingInputs);
+        if (m_metadata.stage == VK_SHADER_STAGE_FRAGMENT_BIT && linkage->fsFlatShading && m_metadata.flatShadingInputs)
+          ioPass.enableFlatInterpolation(m_metadata.flatShadingInputs);
 
         if (m_metadata.stage == VK_SHADER_STAGE_GEOMETRY_BIT && linkage->inputTopology != m_metadata.inputTopology)
           ioPass.changeGsInputPrimitiveType(convertPrimitiveType(linkage->inputTopology));
 
         if (m_metadata.stage == VK_SHADER_STAGE_FRAGMENT_BIT && linkage->fsDualSrcBlend) {
           dxbc_spv::ir::IoMap io = { };
-          io.add(dxbc_spv::ir::IoLocation(dxbc_spv::ir::IoEntryType::ePerVertex, 0u, 0xfu));
-          io.add(dxbc_spv::ir::IoLocation(dxbc_spv::ir::IoEntryType::ePerVertex, 1u, 0xfu));
+          io.add(dxbc_spv::ir::IoLocation(dxbc_spv::ir::IoEntryType::ePerVertex, 0u, 0xfu), dxbc_spv::ir::IoSemantic());
+          io.add(dxbc_spv::ir::IoLocation(dxbc_spv::ir::IoEntryType::ePerVertex, 1u, 0xfu), dxbc_spv::ir::IoSemantic());
 
           ioPass.resolveUnusedOutputs(io);
         }
@@ -1546,18 +2069,30 @@ namespace dxvk {
           ioPass.swizzleOutputs(swizzles.size(), swizzles.data());
         }
 
+        bool matchSemantics = linkage->semanticIo && m_metadata.flags.test(DxvkShaderFlag::SemanticIo);
+
         if (m_metadata.stage != VK_SHADER_STAGE_COMPUTE_BIT && !DxvkShaderIo::checkStageCompatibility(
-            m_metadata.stage, m_metadata.inputs, linkage->prevStage, linkage->prevStageOutputs))
-          ioPass.resolveMismatchedIo(convertShaderStage(linkage->prevStage), convertIoMap(linkage->prevStageOutputs, linkage->prevStage));
+            m_metadata.stage, m_metadata.inputs, linkage->prevStage, linkage->prevStageOutputs, matchSemantics)) {
+          auto prevStageIoMap = convertIoMap(linkage->prevStageOutputs, linkage->prevStage);
+
+          if (matchSemantics)
+            ioPass.resolveSemanticIo(prevStageIoMap);
+
+          ioPass.resolveMismatchedIo(convertShaderStage(linkage->prevStage), prevStageIoMap);
+        }
 
         if (m_metadata.stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)
           ioPass.resolvePatchConstantLocations(convertIoMap(m_metadata.outputs, m_metadata.stage));
 
         if (m_metadata.stage == VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)
           ioPass.resolvePatchConstantLocations(convertIoMap(linkage->prevStageOutputs, linkage->prevStage));
+      } else if (m_metadata.stage != VK_SHADER_STAGE_COMPUTE_BIT) {
+        ioPass.lowerSpecConstantsToCbv(SpecDataSet, 0u);
       }
 
-      if (m_metadata.stage == VK_SHADER_STAGE_FRAGMENT_BIT && m_info.options.flags.test(DxvkShaderCompileFlag::EnableSampleRateShading))
+      if (m_metadata.stage == VK_SHADER_STAGE_FRAGMENT_BIT
+       && m_info.options.flags.test(DxvkShaderCompileFlag::EnableSampleRateShading)
+       && (!linkage || !linkage->sampleLocations))
         ioPass.enableSampleInterpolation();
     }
 
@@ -1568,10 +2103,11 @@ namespace dxvk {
     options.includeDebugNames = true;
     options.nvRawAccessChains = m_info.options.spirv.test(DxvkShaderSpirvFlag::SupportsNvRawAccessChains);
     options.dualSourceBlending = linkage && linkage->fsDualSrcBlend;
+    options.zeroInitializeScratch = m_info.options.spirv.test(DxvkShaderSpirvFlag::ZeroScratchMemory);
 
     if (m_info.options.spirv.all(DxvkShaderSpirvFlag::IndependentDenormMode,
-                               DxvkShaderSpirvFlag::SupportsRte32,
-                               DxvkShaderSpirvFlag::SupportsDenormFlush32)) {
+                                 DxvkShaderSpirvFlag::SupportsRte32,
+                                 DxvkShaderSpirvFlag::SupportsDenormFlush32)) {
       if (m_info.options.spirv.test(DxvkShaderSpirvFlag::SupportsRte16))
         options.supportedRoundModesF16 |= dxbc_spv::ir::RoundMode::eNearestEven;
       if (m_info.options.spirv.test(DxvkShaderSpirvFlag::SupportsRte32))
@@ -1647,12 +2183,12 @@ namespace dxvk {
 
 
   void DxvkIrShader::convertIr(const char* reason) {
-    if (m_convertedIr.load(std::memory_order_acquire))
+    if (m_convertedIr.load())
       return;
 
     std::lock_guard lock(m_mutex);
 
-    if (m_convertedIr.load(std::memory_order_relaxed))
+    if (m_convertedIr.load())
       return;
 
     if (reason && Logger::logLevel() <= LogLevel::Debug)
@@ -1668,7 +2204,7 @@ namespace dxvk {
     // Destroy original converter, we no longer need it
     m_baseIr = nullptr;
 
-    m_convertedIr.store(true, std::memory_order_release);
+    m_convertedIr.store(true);
 
     // Need to do this *after* marking the conversion as done since lowering
     // to SPIR-V itself will otherwise call into this method again
@@ -1701,6 +2237,7 @@ namespace dxvk {
     options.arithmeticOptions.lowerDot = true;
     options.arithmeticOptions.lowerSinCos = m_info.options.flags.test(DxvkShaderCompileFlag::LowerSinCos);
     options.arithmeticOptions.lowerMsad = true;
+    options.arithmeticOptions.lowerUdiv = true;
     options.arithmeticOptions.lowerF32toF16 = m_info.options.flags.test(DxvkShaderCompileFlag::LowerF32toF16);
     options.arithmeticOptions.lowerConvertFtoI = m_info.options.flags.test(DxvkShaderCompileFlag::LowerFtoI);
     options.arithmeticOptions.lowerGsVertexCountIn = false;
@@ -1734,6 +2271,9 @@ namespace dxvk {
     options.derivativeOptions.hoistDescriptorLoads = true;
 
     options.cseOptions.relocateDescriptorLoad = true;
+    options.cseOptions.resolveOverlappingLoads = true;
+
+    options.bufferIndexing.allowDynamicIndexing = true;
 
     if (m_info.options.spirv.test(DxvkShaderSpirvFlag::SupportsResourceIndexing))
       options.descriptorIndexing.optimizeDescriptorIndexing = true;
@@ -1746,6 +2286,7 @@ namespace dxvk {
 
     m_metadata = lowerBindingModelPass.getMetadata();
     m_layout = lowerBindingModelPass.getLayout();
+    m_layout.addSpecDataBuffer(DxvkShaderBinding(m_metadata.stage, SpecDataSet, 0u));
 
     serializeIr(builder);
   }
@@ -1861,15 +2402,23 @@ namespace dxvk {
       if (var.builtIn != spv::BuiltInMax) {
         auto builtIn = convertBuiltIn(var.builtIn, stage);
 
-        if (builtIn)
-          map.add(dxbc_spv::ir::IoLocation(*builtIn, uint8_t((1u << var.componentCount) - 1u)));
+        if (builtIn) {
+          map.add(
+            dxbc_spv::ir::IoLocation(*builtIn, uint8_t((1u << var.componentCount) - 1u)),
+            dxbc_spv::ir::IoSemantic());
+        }
       } else {
         auto type = var.isPatchConstant
           ? dxbc_spv::ir::IoEntryType::ePerPatch
           : dxbc_spv::ir::IoEntryType::ePerVertex;
 
+        dxbc_spv::ir::IoSemantic semantic = { };
+        semantic.name = var.semanticName;
+        semantic.index = var.semanticIndex;
+
         map.add(dxbc_spv::ir::IoLocation(type, var.location,
-          ((1u << var.componentCount) - 1u) << var.componentIndex));
+          ((1u << var.componentCount) - 1u) << var.componentIndex),
+          std::move(semantic));
       }
     }
 
@@ -1934,6 +2483,10 @@ namespace dxvk {
         return dxbc_spv::ir::BuiltIn::eLocalThreadId;
       case spv::BuiltInLocalInvocationIndex:
         return dxbc_spv::ir::BuiltIn::eLocalThreadIndex;
+      case spv::BuiltInPointSize:
+        return dxbc_spv::ir::BuiltIn::ePointSize;
+      case spv::BuiltInPointCoord:
+        return dxbc_spv::ir::BuiltIn::ePointCoord;
       default:
         return std::nullopt;
     }

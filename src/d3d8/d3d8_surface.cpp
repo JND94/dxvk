@@ -27,11 +27,12 @@ namespace dxvk {
 
     d3d9::D3DSURFACE_DESC desc;
     HRESULT res = GetD3D9()->GetDesc(&desc);
+    if (unlikely(FAILED(res)))
+      return res;
 
-    if (likely(SUCCEEDED(res)))
-      ConvertSurfaceDesc8(&desc, pDesc);
+    ConvertSurfaceDesc8(&desc, pDesc);
 
-    return res;
+    return D3D_OK;
   }
 
   HRESULT STDMETHODCALLTYPE D3D8Surface::LockRect(
@@ -43,36 +44,6 @@ namespace dxvk {
 
   HRESULT STDMETHODCALLTYPE D3D8Surface::UnlockRect() {
     return GetD3D9()->UnlockRect();
-  }
-
-  // TODO: Consider creating only one texture to
-  // encompass all surface levels of a texture.
-  Com<d3d9::IDirect3DSurface9> D3D8Surface::GetBlitImage() {
-    if (unlikely(m_blitImage == nullptr)) {
-      m_blitImage = CreateBlitImage();
-    }
-
-    return m_blitImage;
-  }
-
-  Com<d3d9::IDirect3DSurface9> D3D8Surface::CreateBlitImage() {
-    d3d9::D3DSURFACE_DESC desc;
-    GetD3D9()->GetDesc(&desc);
-
-    // NOTE: This adds a D3DPOOL_DEFAULT resource to the
-    // device, which counts as losable during device reset
-    Com<d3d9::IDirect3DSurface9> image;
-    HRESULT res = GetParent()->GetD3D9()->CreateRenderTarget(
-      desc.Width, desc.Height, desc.Format,
-      d3d9::D3DMULTISAMPLE_NONE, 0,
-      FALSE,
-      &image,
-      NULL);
-
-    if (FAILED(res))
-      throw DxvkError("D3D8: Failed to create blit image");
-
-    return image;
   }
 
 }

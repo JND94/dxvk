@@ -7,7 +7,6 @@
 #include "../dxgi/dxgi_interfaces.h"
 
 #include "../dxvk/dxvk_cs.h"
-#include "../dxvk/dxvk_latency_reflex.h"
 
 #include "../d3d10/d3d10_device.h"
 
@@ -39,6 +38,7 @@ namespace dxvk {
   class D3D11Texture1D;
   class D3D11Texture2D;
   class D3D11Texture3D;
+  class D3D11SwapChain;
   
   /**
    * \brief D3D11 device implementation
@@ -469,13 +469,14 @@ namespace dxvk {
 
     bool Is11on12Device() const;
 
+    void LockBuffer(
+      const Rc<DxvkBuffer>&           Buffer);
+
     bool LockImage(
       const Rc<DxvkImage>&            Image,
             VkImageUsageFlags         Usage);
 
-    static D3D_FEATURE_LEVEL GetMaxFeatureLevel(
-      const Rc<DxvkInstance>& Instance,
-      const Rc<DxvkAdapter>&  Adapter);
+    static D3D_FEATURE_LEVEL GetMaxFeatureLevel(const DxvkDevice& Device);
     
     DxvkBarrierControlFlags GetOptionsBarrierControlFlags() {
       DxvkBarrierControlFlags barrierControl = 0u;
@@ -508,7 +509,6 @@ namespace dxvk {
 
     D3D11Initializer*               m_initializer = nullptr;
     D3D10Device*                    m_d3d10Device = nullptr;
-    Com<D3D11ImmediateContext, false> m_context;
 
     D3D11StateObjectSet<D3D11BlendState>        m_bsStateObjects;
     D3D11StateObjectSet<D3D11DepthStencilState> m_dsStateObjects;
@@ -518,6 +518,8 @@ namespace dxvk {
 
     D3D_FEATURE_LEVEL               m_maxFeatureLevel;
     D3D11DeviceFeatures             m_deviceFeatures;
+
+    Com<D3D11ImmediateContext, false> m_context;
 
     HRESULT CreateShaderModule(
             D3D11CommonShader*      pShaderModule,
@@ -820,26 +822,22 @@ namespace dxvk {
     HRESULT STDMETHODCALLTYPE GetLatencyInfo(
             D3D_LOW_LATENCY_RESULTS*      pLowLatencyResults);
 
-    void RegisterLatencyTracker(
-            Rc<DxvkLatencyTracker>          Tracker);
+    void RegisterSwapChain(D3D11SwapChain* pSwapChain);
 
-    void UnregisterLatencyTracker(
-            Rc<DxvkLatencyTracker>          Tracker);
+    void UnregisterSwapChain(D3D11SwapChain* pSwapChain);
 
   private:
 
-    D3D11DXGIDevice*  m_container;
-    D3D11Device*      m_device;
+    D3D11DXGIDevice*          m_container     = nullptr;
+    D3D11Device*              m_device        = nullptr;
 
-    bool              m_reflexEnabled = false;
+    bool                      m_reflexEnabled = false;
 
-    dxvk::mutex       m_mutex;
+    dxvk::mutex               m_mutex;
 
-    bool              m_enableLowLatency  = false;
-    bool              m_enableBoost       = false;
-    uint64_t          m_minIntervalUs     = 0u;
+    VkLatencySleepModeInfoNV  m_sleepMode = { VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV };
+    D3D11SwapChain*           m_swapChain = nullptr;
 
-    Rc<DxvkReflexLatencyTrackerNv>  m_tracker;
   };
 
 
@@ -990,6 +988,10 @@ namespace dxvk {
     
     Rc<DxvkDevice> STDMETHODCALLTYPE GetDXVKDevice();
 
+    D3D11ReflexDevice* GetReflexDevice() {
+      return &m_d3d11Reflex;
+    }
+
     BOOL Is11on12Device() const {
       return m_d3d11on12.Is11on12Device();
     }
@@ -1013,8 +1015,16 @@ namespace dxvk {
     DXGIVkSwapChainFactory   m_dxvkFactory;
 
     D3DDestructionNotifier   m_destructionNotifier;
-    
+
+    struct {
+      HMODULE igd10iumd64 = nullptr;
+    } m_vendorHacks;
+
     uint32_t m_frameLatency = DefaultFrameLatency;
+
+    HMODULE initVendorHacks();
+
+    void cleanupVendorHacks();
 
   };
   

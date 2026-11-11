@@ -231,6 +231,7 @@ std::ostream& operator << (std::ostream& os, VkFormat e) {
     ENUM_NAME(VK_FORMAT_ASTC_12x10_SRGB_BLOCK);
     ENUM_NAME(VK_FORMAT_ASTC_12x12_UNORM_BLOCK);
     ENUM_NAME(VK_FORMAT_ASTC_12x12_SRGB_BLOCK);
+    ENUM_NAME(VK_FORMAT_A8_UNORM);
     ENUM_DEFAULT(e);
   }
   return os;
@@ -444,4 +445,14 @@ std::ostream& operator << (std::ostream& os, VkExtent2D e) {
 
 std::ostream& operator << (std::ostream& os, VkExtent3D e) {
   return os << "(" << e.width << "," << e.height << "," << e.depth << ")";
+}
+
+std::ostream& operator << (std::ostream& os, VkPresentStageFlagBitsEXT e) {
+  switch (e) {
+    ENUM_NAME(VK_PRESENT_STAGE_QUEUE_OPERATIONS_END_BIT_EXT);
+    ENUM_NAME(VK_PRESENT_STAGE_REQUEST_DEQUEUED_BIT_EXT);
+    ENUM_NAME(VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT);
+    ENUM_NAME(VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_VISIBLE_BIT_EXT);
+    ENUM_DEFAULT(e);
+  }
 }

@@ -48,6 +48,24 @@ namespace dxvk {
       bufferUsage |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 
     m_allocationCache = m_device->createAllocationCache(bufferUsage, memoryFlags);
+
+    // Determine maximum tess factor based on device options
+    if (!IsDeferred) {
+      int32_t maxTessFactor = int32_t(std::min(m_device->properties().core.properties.limits.maxTessellationGenerationLevel, 64u));
+
+      if (m_parent->GetOptions()->maxTessFactor > 0)
+        maxTessFactor = std::min(maxTessFactor, m_parent->GetOptions()->maxTessFactor);
+
+      EmitCs([
+        cMaxTessFactor = maxTessFactor
+      ] (DxvkContext* ctx) {
+        D3D11HsPushData pushData = {};
+        pushData.maxTessFactor = float(cMaxTessFactor);
+
+        ctx->pushData(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+          0, sizeof(pushData), &pushData);
+      });
+    }
   }
 
 
@@ -173,11 +191,28 @@ namespace dxvk {
     if (!pResourceView || (NumRects && pRects))
       return;
 
-    // ID3D11View has no methods to query the exact type of
-    // the view, so we'll have to check each possible class
-    auto dsv = dynamic_cast<D3D11DepthStencilView*>(pResourceView);
-    auto rtv = dynamic_cast<D3D11RenderTargetView*>(pResourceView);
-    auto uav = dynamic_cast<D3D11UnorderedAccessView*>(pResourceView);
+    // ID3D11View has no methods to query the exact type of the view,
+    // so we'll have to check each possible class. Query through COM
+    // rather than dynamic_cast: dynamic_cast relies on RTTI metadata
+    // stored just before the object's vtable, which third-party
+    // vtable-swapping hooks (e.g. overlay/injector DLLs that clone
+    // only the visible function-pointer table) do not preserve, even
+    // though they preserve the table itself well enough for ordinary
+    // virtual calls like QueryInterface to keep working correctly.
+    Com<ID3D11DepthStencilView> qiDsv;
+    Com<ID3D11RenderTargetView> qiRtv;
+    Com<ID3D11UnorderedAccessView> qiUav;
+
+    pResourceView->QueryInterface(IID_PPV_ARGS(&qiDsv));
+    pResourceView->QueryInterface(IID_PPV_ARGS(&qiRtv));
+    pResourceView->QueryInterface(IID_PPV_ARGS(&qiUav));
+
+    auto dsv = static_cast<D3D11DepthStencilView*>(qiDsv.ptr());
+    auto rtv = static_cast<D3D11RenderTargetView*>(qiRtv.ptr());
+    auto uav = static_cast<D3D11UnorderedAccessView*>(qiUav.ptr());
+
+    if (rtv && rtv->GetBufferView())
+      return;
 
     Rc<DxvkImageView> view;
     if (dsv) view = dsv->GetImageView();
@@ -205,7 +240,10 @@ namespace dxvk {
 
     if (rtv || dsv) {
       EmitCs([cView = view] (DxvkContext* ctx) {
-        ctx->clearRenderTarget(cView, 0, VkClearValue(), cView->info().aspects);
+        DxvkAttachment attachment = {};
+        attachment.view = cView;
+
+        ctx->clearRenderTarget(attachment, 0, VkClearValue(), cView->info().aspects);
       });
     }
   }
@@ -427,16 +465,16 @@ namespace dxvk {
 
     AddCost(GpuCostEstimate::Transfer);
 
-    auto view  = rtv->GetImageView();
-    auto color = ConvertColorValue(ColorRGBA, view->formatInfo());
+    DxvkAttachment attachment = {};
+    attachment.view = rtv->GetImageView();
+    attachment.shadow = rtv->GetBufferView();
 
     EmitCs([
-      cClearValue = color,
-      cImageView  = std::move(view)
+      cClearValue = ConvertColorValue(ColorRGBA, attachment.view->formatInfo()),
+      cAttachment = std::move(attachment)
     ] (DxvkContext* ctx) {
-      ctx->clearRenderTarget(cImageView,
-        VK_IMAGE_ASPECT_COLOR_BIT,
-        cClearValue, 0u);
+      ctx->clearRenderTarget(cAttachment,
+        VK_IMAGE_ASPECT_COLOR_BIT, cClearValue, 0u);
     });
   }
 
@@ -561,7 +599,10 @@ namespace dxvk {
         imageUsage.viewFormatCount = 1;
         imageUsage.viewFormats = &cDstFormat;
 
-        ctx->ensureImageCompatibility(cDstView->image(), imageUsage);
+        if (!ctx->ensureImageCompatibility(cDstView->image(), imageUsage)) {
+          Logger::err("D3D11: Failed to recreate image for ClearUAV");
+          return;
+        }
 
         // If necessary, recreate the view
         Rc<DxvkImageView> view = cDstView;
@@ -671,12 +712,15 @@ namespace dxvk {
     clearValue.depthStencil.depth   = Depth;
     clearValue.depthStencil.stencil = Stencil;
 
+    DxvkAttachment attachment = {};
+    attachment.view = dsv->GetImageView();
+
     EmitCs([
       cClearValue = clearValue,
       cAspectMask = aspectMask,
-      cImageView  = dsv->GetImageView()
+      cAttachment = std::move(attachment)
     ] (DxvkContext* ctx) {
-      ctx->clearRenderTarget(cImageView,
+      ctx->clearRenderTarget(cAttachment,
         cAspectMask, cClearValue, 0u);
     });
   }
@@ -695,12 +739,23 @@ namespace dxvk {
 
     AddCost(GpuCostEstimate::Transfer);
 
-    // ID3D11View has no methods to query the exact type of
-    // the view, so we'll have to check each possible class
-    auto dsv = dynamic_cast<D3D11DepthStencilView*>(pView);
-    auto rtv = dynamic_cast<D3D11RenderTargetView*>(pView);
-    auto uav = dynamic_cast<D3D11UnorderedAccessView*>(pView);
-    auto vov = dynamic_cast<D3D11VideoProcessorOutputView*>(pView);
+    // ID3D11View has no methods to query the exact type of the view,
+    // so we'll have to check each possible class. Query through COM
+    // rather than dynamic_cast; see DiscardViewBase for why.
+    Com<ID3D11DepthStencilView> qiDsv;
+    Com<ID3D11RenderTargetView> qiRtv;
+    Com<ID3D11UnorderedAccessView> qiUav;
+    Com<ID3D11VideoProcessorOutputView> qiVov;
+
+    pView->QueryInterface(IID_PPV_ARGS(&qiDsv));
+    pView->QueryInterface(IID_PPV_ARGS(&qiRtv));
+    pView->QueryInterface(IID_PPV_ARGS(&qiUav));
+    pView->QueryInterface(IID_PPV_ARGS(&qiVov));
+
+    auto dsv = static_cast<D3D11DepthStencilView*>(qiDsv.ptr());
+    auto rtv = static_cast<D3D11RenderTargetView*>(qiRtv.ptr());
+    auto uav = static_cast<D3D11UnorderedAccessView*>(qiUav.ptr());
+    auto vov = static_cast<D3D11VideoProcessorOutputView*>(qiVov.ptr());
 
     // Retrieve underlying resource view
     if (dsv) {
@@ -710,6 +765,12 @@ namespace dxvk {
         ClearImageView(std::move(imgView), Color, pRect, NumRects);
     } else if (rtv) {
       Rc<DxvkImageView> imgView = rtv->GetImageView();
+      Rc<DxvkBufferView> bufView = rtv->GetBufferView();
+
+      if (bufView) {
+        Logger::err("D3D11: ClearView on buffer RTV not supported.");
+        return;
+      }
 
       if (imgView)
         ClearImageView(std::move(imgView), Color, pRect, NumRects);
@@ -895,6 +956,9 @@ namespace dxvk {
           getDefaultResolveMode(format), VK_RESOLVE_MODE_NONE);
       });
     }
+
+    if constexpr (!IsDeferred)
+      GetTypedContext()->NotifyResolve();
 
     if (dstTextureInfo->HasSequenceNumber())
       GetTypedContext()->TrackTextureSequenceNumber(dstTextureInfo, DstSubresource);
@@ -1085,9 +1149,6 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
     SetDrawBuffers(pBufferForArgs, nullptr);
 
-    if (!ValidateDrawBufferSize(pBufferForArgs, AlignedByteOffsetForArgs, sizeof(VkDrawIndexedIndirectCommand)))
-      return;
-
     if (unlikely(HasDirtyGraphicsBindings()))
       ApplyDirtyGraphicsBindings();
 
@@ -1122,9 +1183,6 @@ namespace dxvk {
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
     SetDrawBuffers(pBufferForArgs, nullptr);
-
-    if (!ValidateDrawBufferSize(pBufferForArgs, AlignedByteOffsetForArgs, sizeof(VkDrawIndirectCommand)))
-      return;
 
     if (unlikely(HasDirtyGraphicsBindings()))
       ApplyDirtyGraphicsBindings();
@@ -1184,9 +1242,6 @@ namespace dxvk {
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
     SetDrawBuffers(pBufferForArgs, nullptr);
-
-    if (!ValidateDrawBufferSize(pBufferForArgs, AlignedByteOffsetForArgs, sizeof(VkDispatchIndirectCommand)))
-      return;
 
     AddCost(GpuCostEstimate::DispatchIndirect);
 
@@ -1638,7 +1693,8 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     auto shader = static_cast<D3D11DomainShader*>(pDomainShader);
-    SetClassInstances<D3D11ShaderType::eDomain>(shader->GetCommonShader(), ppClassInstances, NumClassInstances);
+    SetClassInstances<D3D11ShaderType::eDomain>(
+      shader ? shader->GetCommonShader() : nullptr, ppClassInstances, NumClassInstances);
 
     if (m_state.ds != shader) {
       m_state.ds = shader;
@@ -2376,7 +2432,7 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppBlendState)
-      *ppBlendState = ref(m_state.om.cbState);
+      *ppBlendState = m_state.om.cbState.ref();
 
     if (BlendFactor)
       std::memcpy(BlendFactor, m_state.om.blendFactor, sizeof(FLOAT) * 4);
@@ -2393,7 +2449,7 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppDepthStencilState)
-      *ppDepthStencilState = ref(m_state.om.dsState);
+      *ppDepthStencilState = m_state.om.dsState.ref();
 
     if (pStencilRef)
       *pStencilRef = m_state.om.stencilRef;
@@ -2404,26 +2460,28 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::RSSetState(ID3D11RasterizerState* pRasterizerState) {
     D3D10DeviceLock lock = LockContext();
 
-    auto currRasterizerState = m_state.rs.state;
-    auto nextRasterizerState = static_cast<D3D11RasterizerState*>(pRasterizerState);
+    auto newRasterizerState = static_cast<D3D11RasterizerState*>(pRasterizerState);
 
-    if (m_state.rs.state != nextRasterizerState) {
-      m_state.rs.state = nextRasterizerState;
+    if (m_state.rs.state != newRasterizerState) {
+      // Need to keep the previous rasterizer state object alive for the time being
+      auto oldRasterizerState = std::move(m_state.rs.state);
+
+      m_state.rs.state = newRasterizerState;
       ApplyRasterizerState();
 
       // If necessary, update the rasterizer sample count push constant
-      uint32_t currSampleCount = currRasterizerState != nullptr ? currRasterizerState->Desc()->ForcedSampleCount : 0;
-      uint32_t nextSampleCount = nextRasterizerState != nullptr ? nextRasterizerState->Desc()->ForcedSampleCount : 0;
+      uint32_t oldSampleCount = oldRasterizerState ? oldRasterizerState->Desc().ForcedSampleCount : 0;
+      uint32_t newSampleCount = newRasterizerState ? newRasterizerState->Desc().ForcedSampleCount : 0;
 
-      if (currSampleCount != nextSampleCount)
+      if (oldSampleCount != newSampleCount)
         ApplyRasterizerSampleCount();
 
       // In D3D11, the rasterizer state defines whether the scissor test is
       // enabled, so if that changes, we need to update scissor rects as well.
-      bool currScissorEnable = currRasterizerState && currRasterizerState->Desc()->ScissorEnable;
-      bool nextScissorEnable = nextRasterizerState && nextRasterizerState->Desc()->ScissorEnable;
+      bool oldScissorEnable = oldRasterizerState && oldRasterizerState->Desc().ScissorEnable;
+      bool newScissorEnable = newRasterizerState && newRasterizerState->Desc().ScissorEnable;
 
-      if (currScissorEnable != nextScissorEnable)
+      if (oldScissorEnable != newScissorEnable)
         ApplyViewportState();
     }
   }
@@ -2496,7 +2554,7 @@ namespace dxvk {
       }
     }
 
-    if (dirty && m_state.rs.state && m_state.rs.state->Desc()->ScissorEnable)
+    if (dirty && m_state.rs.state && m_state.rs.state->Desc().ScissorEnable)
       ApplyViewportState();
   }
 
@@ -2506,7 +2564,7 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppRasterizerState)
-      *ppRasterizerState = ref(m_state.rs.state);
+      *ppRasterizerState = m_state.rs.state.ref();
   }
 
 
@@ -3175,7 +3233,7 @@ namespace dxvk {
     DirtyMask.samplerMask -= bindMask;
 
     for (uint32_t slot : bit::BitMask(bindMask))
-      BindSampler(Stage, slot, state.samplers[slot]);
+      BindSampler(Stage, slot, state.samplers[slot].ptr());
   }
 
 
@@ -3422,23 +3480,23 @@ namespace dxvk {
 
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::ApplyRasterizerSampleCount() {
-    D3D11ShaderPushData pc = { };
-    pc.rasterizerSampleCount = m_state.om.sampleCount;
+    D3D11SpecData specData = {};
+    specData.sampleCount = m_state.om.sampleCount;
 
-    if (unlikely(!m_state.om.sampleCount)) {
-      pc.rasterizerSampleCount = m_state.rs.state
-        ? m_state.rs.state->Desc()->ForcedSampleCount
-        : 0;
+    if (unlikely(!specData.sampleCount)) {
+      specData.sampleCount = m_state.rs.state
+        ? m_state.rs.state->Desc().ForcedSampleCount
+        : 0u;
 
-      if (!pc.rasterizerSampleCount)
-        pc.rasterizerSampleCount = 1;
+      if (!specData.sampleCount)
+        specData.sampleCount = 1u;
     }
 
     EmitCs([
-      cPushConstants = pc
+      cSpecData = specData
     ] (DxvkContext* ctx) {
-      ctx->pushData(VK_SHADER_STAGE_ALL_GRAPHICS,
-        0, sizeof(cPushConstants), &cPushConstants);
+      ctx->setSpecConstants(VK_PIPELINE_BIND_POINT_GRAPHICS,
+        0u, sizeof(cSpecData), &cSpecData);
     });
   }
 
@@ -3455,7 +3513,7 @@ namespace dxvk {
 
       // Vulkan does not provide an easy way to disable the scissor test,
       // Set scissor rects that are at least as large as the framebuffer.
-      bool enableScissorTest = m_state.rs.state && m_state.rs.state->Desc()->ScissorEnable;
+      bool enableScissorTest = m_state.rs.state && m_state.rs.state->Desc().ScissorEnable;
 
       // D3D11's coordinate system has its origin in the bottom left,
       // but the viewport coordinates are aligned to the top-left
@@ -3661,6 +3719,7 @@ namespace dxvk {
     for (UINT i = 0; i < m_state.om.rtvs.size(); i++) {
       if (m_state.om.rtvs[i] != nullptr) {
         attachments.color[i].view = m_state.om.rtvs[i]->GetImageView();
+        attachments.color[i].shadow = m_state.om.rtvs[i]->GetBufferView();
         sampleCount = m_state.om.rtvs[i]->GetSampleCount();
       }
     }
@@ -4036,21 +4095,14 @@ namespace dxvk {
       cView       = std::move(View),
       cClearValue = clearValue
     ] (DxvkContext* ctx, const VkRect2D* rects, size_t count) {
-      constexpr VkImageUsageFlags rtUsage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
       VkImageAspectFlags clearAspect = cView->formatInfo()->aspectMask & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT);
 
       for (size_t i = 0; i < count; i++) {
         VkOffset3D offset = { rects[i].offset.x, rects[i].offset.y, 0 };
         VkExtent3D extent = { rects[i].extent.width, rects[i].extent.height, 1u };
 
-        if (extent.width && extent.height) {
-          bool isFullSize = cView->mipLevelExtent(0) == extent;
-
-          if ((cView->info().usage & rtUsage) && isFullSize)
-            ctx->clearRenderTarget(cView, clearAspect, cClearValue, 0u);
-          else
-            ctx->clearImageView(cView, offset, extent, clearAspect, cClearValue);
-        }
+        if (extent.width && extent.height)
+          ctx->clearImageView(cView, offset, extent, clearAspect, cClearValue);
       }
     });
 
@@ -4719,7 +4771,7 @@ namespace dxvk {
 
     for (uint32_t i = 0; i < NumSamplers; i++) {
       ppSamplers[i] = StartSlot + i < bindings.samplers.size()
-        ? ref(bindings.samplers[StartSlot + i])
+        ? bindings.samplers[StartSlot + i].ref()
         : nullptr;
     }
   }
@@ -4810,7 +4862,7 @@ namespace dxvk {
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::ResetCommandListState() {
     EmitCs([
-      cUsedBindings = GetMaxUsedBindings()
+      cUsedBindings  = GetMaxUsedBindings()
     ] (DxvkContext* ctx) {
       // Reset render targets
       ctx->bindRenderTargets(DxvkRenderTargets(), 0u);
@@ -4901,11 +4953,6 @@ namespace dxvk {
           }
         }
       }
-
-      // Initialize push constants
-      D3D11ShaderPushData pc = { };
-      pc.rasterizerSampleCount = 1u;
-      ctx->pushData(VK_SHADER_STAGE_ALL_GRAPHICS, 0, sizeof(pc), &pc);
     });
   }
 
@@ -5126,7 +5173,7 @@ namespace dxvk {
     const auto& bindings = m_state.samplers[Stage];
 
     for (uint32_t i = 0; i < bindings.maxCount; i++)
-      BindSampler(Stage, i, bindings.samplers[i]);
+      BindSampler(Stage, i, bindings.samplers[i].ptr());
   }
 
 
@@ -5328,6 +5375,7 @@ namespace dxvk {
       return;
 
     bool needsUpdate = false;
+    bool isMultisampled = false;
 
     if (likely(NumRTVs != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)) {
       // Native D3D11 does not change the render targets if
@@ -5348,6 +5396,8 @@ namespace dxvk {
           if (NumUAVs == D3D11_KEEP_UNORDERED_ACCESS_VIEWS)
             ResolveOmUavHazards(rtv);
         }
+
+        isMultisampled = isMultisampled || (rtv && rtv->GetSampleCount() > 1u);
       }
 
       auto dsv = static_cast<D3D11DepthStencilView*>(pDepthStencilView);
@@ -5402,7 +5452,7 @@ namespace dxvk {
       BindFramebuffer();
 
       if constexpr (!IsDeferred)
-        GetTypedContext()->NotifyRenderPassBoundary();
+        GetTypedContext()->NotifyRenderPassBoundary(isMultisampled);
     }
   }
 

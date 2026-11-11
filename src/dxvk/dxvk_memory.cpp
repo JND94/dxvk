@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 
 #include "../util/util_bit.h"
@@ -71,7 +72,25 @@ namespace dxvk {
       std::tuple(key), std::tuple()).first->second;
 
     if (key.format) {
-      if (m_device->canUseDescriptorBuffer()) {
+      if (m_device->canUseDescriptorHeap()) {
+        VkHostAddressRangeEXT hostAddress = descriptor.getHostAddressRange();
+
+        VkTexelBufferDescriptorInfoEXT bufferInfo = { VK_STRUCTURE_TYPE_TEXEL_BUFFER_DESCRIPTOR_INFO_EXT };
+        bufferInfo.format = key.format;
+        bufferInfo.addressRange.address = m_va + key.offset;
+        bufferInfo.addressRange.size = key.size;
+
+        VkResourceDescriptorInfoEXT info = { VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT };
+        info.type = (key.usage == VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT)
+          ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
+          : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        info.data.pTexelBuffer = &bufferInfo;
+
+        VkResult vr = vk->vkWriteResourceDescriptorsEXT(vk->device(), 1u, &info, &hostAddress);
+
+        if (vr != VK_SUCCESS)
+          throw DxvkError(str::format("Failed to write Vulkan buffer view descriptor: ", vr));
+      } else if (m_device->canUseDescriptorBuffer()) {
         VkDescriptorAddressInfoEXT bufferInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT };
         bufferInfo.address = m_va + key.offset;
         bufferInfo.range = key.size;
@@ -117,7 +136,22 @@ namespace dxvk {
       bufferInfo.offset = key.offset + baseOffset;
       bufferInfo.range = key.size;
 
-      if (m_device->canUseDescriptorBuffer()) {
+      if (m_device->canUseDescriptorHeap()) {
+        VkHostAddressRangeEXT hostAddress = descriptor.getHostAddressRange();
+
+        VkDeviceAddressRangeEXT bufferRange = { };
+        bufferRange.address = m_va + key.offset;
+        bufferRange.size = key.size;
+
+        VkResourceDescriptorInfoEXT info = { VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT };
+        info.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        info.data.pAddressRange = &bufferRange;
+
+        VkResult vr = vk->vkWriteResourceDescriptorsEXT(vk->device(), 1u, &info, &hostAddress);
+
+        if (vr != VK_SUCCESS)
+          throw DxvkError(str::format("Failed to write Vulkan buffer descriptor: ", vr));
+      } else if (m_device->canUseDescriptorBuffer()) {
         VkDescriptorAddressInfoEXT bufferInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT };
         bufferInfo.address = m_va + key.offset;
         bufferInfo.range = key.size;
@@ -168,36 +202,67 @@ namespace dxvk {
     auto& descriptor = m_views.emplace(std::piecewise_construct,
       std::tuple(key), std::tuple()).first->second;
 
-    VkImageUsageFlags shaderResourceUsage = key.usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
+    VkImageUsageFlags renderTargetUsage = key.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    VkImageUsageFlags shaderResourceUsage = key.usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
 
     VkImageViewUsageCreateInfo usage = { VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO };
     usage.usage = key.usage;
 
-    VkImageViewCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &usage };
-    info.image = m_image;
-    info.viewType = key.viewType;
-    info.format = key.format;
-    info.components = key.unpackSwizzle();
-    info.subresourceRange.aspectMask = key.aspects;
-    info.subresourceRange.baseMipLevel = key.mipIndex;
-    info.subresourceRange.levelCount = key.mipCount;
-    info.subresourceRange.baseArrayLayer = key.layerIndex;
-    info.subresourceRange.layerCount = key.layerCount;
+    VkImageViewCreateInfo viewInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &usage };
+    viewInfo.image = m_image;
+    viewInfo.viewType = key.viewType;
+    viewInfo.format = key.format;
+    viewInfo.components = key.unpackSwizzle();
+    viewInfo.subresourceRange.aspectMask = key.aspects;
+    viewInfo.subresourceRange.baseMipLevel = key.mipIndex;
+    viewInfo.subresourceRange.levelCount = key.mipCount;
+    viewInfo.subresourceRange.baseArrayLayer = key.layerIndex;
+    viewInfo.subresourceRange.layerCount = key.layerCount;
 
-    descriptor.legacy.image.imageLayout = key.layout;
+    if (renderTargetUsage || !m_device->canUseDescriptorHeap() || m_device->hasCudaInterop()) {
+      descriptor.legacy.image.imageLayout = key.layout;
 
-    VkResult vr = vk->vkCreateImageView(
-      vk->device(), &info, nullptr, &descriptor.legacy.image.imageView);
+      VkResult vr = vk->vkCreateImageView(
+        vk->device(), &viewInfo, nullptr, &descriptor.legacy.image.imageView);
 
-    if (vr != VK_SUCCESS)
-      throw DxvkError(str::format("Failed to create Vulkan image view: ", vr));
+      // Not fatal on descriptor heap path
+      if (vr && (renderTargetUsage || !m_device->canUseDescriptorHeap()))
+        throw DxvkError(str::format("Failed to create image view: ", vr));
 
-    if (m_device->canUseDescriptorBuffer() && shaderResourceUsage) {
+      if (vr)
+        Logger::warn(str::format("Failed to create legacy image view: ", vr));
+    }
+
+    if (shaderResourceUsage && m_device->canUseDescriptorHeap()) {
+      VkHostAddressRangeEXT hostAddress = descriptor.getHostAddressRange();
+
+      VkImageDescriptorInfoEXT imageInfo = { VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT };
+      imageInfo.pView = &viewInfo;
+      imageInfo.layout = key.layout;
+
+      VkResourceDescriptorInfoEXT info = { VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT };
+      info.data.pImage = &imageInfo;
+
+      if (key.usage & VK_IMAGE_USAGE_STORAGE_BIT)
+        info.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      else if (key.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)
+        info.type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+      else
+        info.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+
+      VkResult vr = vk->vkWriteResourceDescriptorsEXT(vk->device(), 1u, &info, &hostAddress);
+
+      if (vr != VK_SUCCESS)
+        throw DxvkError(str::format("Failed to write Vulkan image view descriptor: ", vr));
+    } else if (m_device->canUseDescriptorBuffer() && shaderResourceUsage) {
       VkDescriptorGetInfoEXT info = { VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT };
 
-      if (shaderResourceUsage == VK_IMAGE_USAGE_STORAGE_BIT) {
+      if (shaderResourceUsage & VK_IMAGE_USAGE_STORAGE_BIT) {
         info.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         info.data.pStorageImage = &descriptor.legacy.image;
+      } else if (shaderResourceUsage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) {
+        info.type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+        info.data.pInputAttachmentImage = &descriptor.legacy.image;
       } else {
         info.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         info.data.pSampledImage = &descriptor.legacy.image;
@@ -629,15 +694,28 @@ namespace dxvk {
     VkDeviceSize totalSize = 0u;
 
     for (uint32_t i = 0; i < count; i++) {
-      auto iter = m_entries.begin();
+      // Keep traversing keys in ascending order and only reset once we've
+      // reached the end. This helps avoid starving higher-ordered requests.
+      auto iter = m_entries.upper_bound(m_lastKey);
+      iter = iter == m_entries.end() ? m_entries.begin() : iter;
+
+      if (iter == m_entries.end())
+        break;
 
       if (totalSize && totalSize + iter->first.size > size)
         break;
 
-      totalSize += iter->first.size;
+      // Reduce number of resource evictions performed per request by
+      // overestimating the amount of memory moved. May reduce stutter
+      // in high-ish frame rate scenarios.
+      totalSize += iter->second.mode.test(DxvkAllocationMode::NoDeviceMemory)
+        ? iter->first.size * 16u
+        : iter->first.size;
 
       result.push_back(std::move(iter->second));
-      m_entries.erase(iter);
+      m_lastKey = iter->first;
+
+      iter = m_entries.erase(iter);
     }
 
     return result;
@@ -905,10 +983,6 @@ namespace dxvk {
           // for any relevant memory pools as necessary.
           if (refillAllocationCache(allocationCache, memoryRequirements, allocationInfo.properties))
             return allocationCache->allocateFromCache(createInfo.size);
-        } else {
-          // Do not suballocate buffers if debug mode is enabled in order
-          // to allow the application to set meaningful debug names.
-          allowSuballocation = !m_device->debugFlags().test(DxvkDebugFlag::Capture);
         }
 
         // If there is at least one memory type that supports the required
@@ -982,7 +1056,7 @@ namespace dxvk {
       // ca expect these to be long-lived and mapped, and potentially use a dedicated
       // memory type that may have unexpected size restrictions. Also make sure not
       // to ever relocate these buffers since they require a stable GPU address.
-      if (createInfo.usage & DescriptorBufferUsage) {
+      if (createInfo.usage & (DescriptorBufferUsage | DescriptorHeapUsage)) {
         VkMemoryDedicatedAllocateInfo dedicatedInfo = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
         dedicatedInfo.buffer = buffer;
 
@@ -1009,9 +1083,8 @@ namespace dxvk {
         logMemoryStats();
       }
     } else {
-      allocation = createAllocation(
-        new DxvkSparsePageTable(m_device, createInfo, buffer),
-        allocationInfo);
+      auto pageTable = new DxvkSparsePageTable(m_device, createInfo, buffer);
+      allocation = allocateSparsePageTable(pageTable, allocationInfo);
     }
 
     if (!allocation) {
@@ -1158,7 +1231,7 @@ namespace dxvk {
           allocation->m_sparsePageTable = pageTable.release();
       } else {
         // Just need a page table, but no memory
-        allocation = createAllocation(pageTable.release(), allocationInfo);
+        allocation = allocateSparsePageTable(pageTable.release(), allocationInfo);
       }
     }
 
@@ -1241,9 +1314,11 @@ namespace dxvk {
     const VkBufferCreateInfo&         createInfo,
     const DxvkAllocationInfo&         allocationInfo,
     const DxvkBufferImportInfo&       importInfo) {
+    std::lock_guard lock(m_mutex);
+
     Rc<DxvkResourceAllocation> allocation = m_allocationPool.create(this, nullptr);
     allocation->m_flags.set(DxvkAllocationFlag::Imported);
-    allocation->m_resourceCookie = allocation->m_resourceCookie;
+    allocation->m_resourceCookie = allocationInfo.resourceCookie;
     allocation->m_size = createInfo.size;
     allocation->m_mapPtr = importInfo.mapPtr;
     allocation->m_buffer = importInfo.buffer;
@@ -1260,9 +1335,11 @@ namespace dxvk {
     const VkImageCreateInfo&          createInfo,
     const DxvkAllocationInfo&         allocationInfo,
           VkImage                     imageHandle) {
+    std::lock_guard lock(m_mutex);
+
     Rc<DxvkResourceAllocation> allocation = m_allocationPool.create(this, nullptr);
     allocation->m_flags.set(DxvkAllocationFlag::Imported);
-    allocation->m_resourceCookie = allocation->m_resourceCookie;
+    allocation->m_resourceCookie = allocationInfo.resourceCookie;
     allocation->m_image = imageHandle;
 
     return allocation;
@@ -1281,14 +1358,12 @@ namespace dxvk {
     if (type.bufferUsage && !next)
       size = align(size, GlobalBufferAlignment);
 
-    // Preemptively free some unused allocations to reduce memory waste
-    freeEmptyChunksInHeap(*type.heap, size, high_resolution_clock::now());
+    // Preemptively free some unused allocations to reduce memory waste.
+    freeEmptyChunksForType(type, size, high_resolution_clock::now());
 
     // If we're exceeding vram budget on a dedicated GPU, fall back to system memory.
-    if (!next && type.heap->enforceBudget && (getMemoryStats(type.heap->index).memoryAllocated + size > type.heap->memoryBudget)) {
-      type.heap->enableEviction = true;
+    if (!next && type.heap->enforceBudget && (getMemoryStats(type.heap->index).memoryAllocated + size > type.heap->memoryBudget))
       return DxvkDeviceMemory();
-    }
 
     VkMemoryAllocateInfo memoryInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, next };
     memoryInfo.allocationSize = size;
@@ -1306,7 +1381,7 @@ namespace dxvk {
       } else if (type.properties.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
         // Regular HVV allocation. Give this a low priority since these are typically
         // useful when when placed in system memory.
-        priorityInfo.priority = 0.0f;
+        priorityInfo.priority = 0.1f;
       } else {
         // Standard priority for resource allocations
         priorityInfo.priority = 0.5f;
@@ -1518,9 +1593,11 @@ namespace dxvk {
   }
 
 
-  DxvkResourceAllocation* DxvkMemoryAllocator::createAllocation(
+  DxvkResourceAllocation* DxvkMemoryAllocator::allocateSparsePageTable(
           DxvkSparsePageTable*  sparsePageTable,
     const DxvkAllocationInfo&   allocationInfo) {
+    std::lock_guard lock(m_mutex);
+
     auto allocation = m_allocationPool.create(this, nullptr);
     allocation->m_resourceCookie = allocationInfo.resourceCookie;
     allocation->m_sparsePageTable = sparsePageTable;
@@ -1657,6 +1734,38 @@ namespace dxvk {
   }
 
 
+  void DxvkMemoryAllocator::freeEmptyChunksForType(
+          DxvkMemoryType&       type,
+          VkDeviceSize          allocationSize,
+          high_resolution_clock::time_point time) {
+    bool freed = false;
+
+    // Always check the memory type that we actually want to allocate memory from first
+    freed |= freeEmptyChunksInPool(type, type.devicePool, allocationSize, time);
+    freed |= freeEmptyChunksInPool(type, type.mappedPool, allocationSize, time);
+
+    // When allocating HVV, do not mess around with the main device-local memory type
+    // since that is generally going to be far more important for performance. Instead,
+    // simply fall back to system memory.
+    VkMemoryPropertyFlags hvvFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+    bool isHvv = (type.properties.propertyFlags & hvvFlags) == hvvFlags && type.heap->enforceBudget;
+
+    if (!isHvv) {
+      for (auto typeIndex : bit::BitMask(type.heap->memoryTypes & ~(1u << type.index))) {
+        auto& type = m_memTypes[typeIndex];
+
+        freed |= freeEmptyChunksInPool(type, type.devicePool, allocationSize, time);
+        freed |= freeEmptyChunksInPool(type, type.mappedPool, allocationSize, time);
+      }
+    }
+
+    if (freed)
+      updateMemoryHeapStats(type.heap->index);
+  }
+
+
   void DxvkMemoryAllocator::freeEmptyChunksInHeap(
     const DxvkMemoryHeap&       heap,
           VkDeviceSize          allocationSize,
@@ -1706,7 +1815,7 @@ namespace dxvk {
       // Free the chunk if it is smaller than the current chunk size of
       // the pool, since it is unlikely to be useful for future allocations.
       // Also free if the pending allocation would exceed the heap budget.
-      bool shouldFree = chunk.memory.size < pool.nextChunkSize
+      bool shouldFree = (chunk.memory.size < pool.nextChunkSize && allocationSize)
         || allocationSize + heapAllocated > heapBudget
         || allocationSize > heapBudget;
 
@@ -2035,6 +2144,9 @@ namespace dxvk {
     // non-descriptor allocation to enable those bits.
     VkBufferUsageFlags descriptorHeapUsage = 0u;
 
+    if (m_device->canUseDescriptorHeap())
+      descriptorHeapUsage |= DescriptorHeapUsage;
+
     if (m_device->canUseDescriptorBuffer())
       descriptorHeapUsage |= DescriptorBufferUsage;
 
@@ -2121,8 +2233,27 @@ namespace dxvk {
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
+    uint32_t hostVisibleVramIndex = uint32_t(
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    // Handle obscure setups where cached memory is unavailable.
     if (!m_memTypesByPropertyFlags[hostCachedIndex])
       m_memTypesByPropertyFlags[hostCachedIndex] = m_memTypesByPropertyFlags[hostCoherentIndex];
+
+    // If we zero mapped memory, we need good CPU memory bandwidth.
+    // Prefer uncached system memory over HVV in that case.
+    if (m_device->config().zeroMappedMemory)
+      m_memTypesByPropertyFlags[hostVisibleVramIndex] = m_memTypesByPropertyFlags[hostCoherentIndex];
+
+    // On tilers, we are likely running on an ARM system where uncached
+    // stores are expected to be very slow. Always use cached memory
+    // for mapped allocations.
+    if (m_device->perfHints().preferCachedMemory) {
+      m_memTypesByPropertyFlags[hostCoherentIndex] = m_memTypesByPropertyFlags[hostCachedIndex];
+      m_memTypesByPropertyFlags[hostVisibleVramIndex] = m_memTypesByPropertyFlags[hostCachedIndex];
+    }
   }
 
 
@@ -2305,7 +2436,25 @@ namespace dxvk {
 
   uint32_t DxvkMemoryAllocator::getMemoryTypeMask(
           VkMemoryPropertyFlags properties) const {
-    return m_memTypesByPropertyFlags[uint32_t(properties) % uint32_t(m_memTypesByPropertyFlags.size())];
+    uint32_t index = uint32_t(properties);
+    uint32_t count = uint32_t(m_memTypesByPropertyFlags.size());
+
+    if (likely(index < count))
+      return m_memTypesByPropertyFlags[index];
+
+    // If we get asked for uncommon memory properties, scan
+    // memory types for the requested flags
+    uint32_t mask = 0u;
+
+    for (uint32_t i = 0u; i < m_memTypes.size(); i++) {
+      if ((m_memTypes[i].properties.propertyFlags & properties) == properties)
+        mask |= 1u << i;
+    }
+
+    if (!mask)
+      mask = m_memTypesByPropertyFlags[index % count];
+
+    return mask;
   }
 
 
@@ -2534,42 +2683,38 @@ namespace dxvk {
     auto& pool = type.devicePool;
 
     // Doing this on integrated graphics would be harmful, so don't'
-    if (pool.chunks.empty() || !type.heap->enableEviction)
+    if (pool.chunks.empty() || !type.heap->enforceBudget)
       return;
 
-    // Work out how much memory we should ideally leave unused
-    VkDeviceSize minUnusedMemory = 2u * pool.maxChunkSize;
+    // If we're within budget with some headroom already, don't evict
+    // anything as we're likely able to service subsequent allocations.
+    DxvkMemoryStats heapStats = getMemoryStats(type.heap->index);
 
-    // Account for mapped memory types on the same heap where we may not be
-    // able to move any resources, and count their total allocated amount.
-    VkDeviceSize heapUsage = type.stats.memoryUsed;
-
-    for (auto i : bit::BitMask(type.heap->memoryTypes & ~(1u << type.index)))
-      heapUsage += m_memTypes[i].stats.memoryAllocated;
-
-    // If we're within budget with some headroom already, don't evict anything.
-    VkDeviceSize heapBudget = getMemoryStats(type.heap->index).memoryBudget;
-
-    if (heapUsage + minUnusedMemory <= heapBudget)
+    if (heapStats.memoryAllocated + pool.maxChunkSize < heapStats.memoryBudget)
       return;
+
+    // If there's an empty chunk of the maximum allowed size, there's
+    // no real point in evicting anything either since new allocations
+    // can just go there.
+    for (uint32_t i = 0u; i < pool.chunks.size(); i++) {
+      if (!pool.pageAllocator.pagesUsed(i) && pool.chunks[i].memory.size == pool.maxChunkSize)
+        return;
+    }
 
     // Check the old previous chunk to evict unused resources right
     // away, and then advance to the next available chunk if possible
     std::array<uint32_t, 2u> chunkIndices = { pool.nextEvictChunk, ~0u };
 
-    for (uint32_t i = 0u; i < pool.chunks.size(); i++) {
-      pool.nextEvictChunk += 1u;
-      pool.nextEvictChunk %= pool.chunks.size();
+    pool.nextEvictChunk += 1u;
+    pool.nextEvictChunk %= pool.chunks.size();
 
-      if (pool.pageAllocator.chunkIsAvailable(pool.nextEvictChunk))
-        break;
-    }
+    if (chunkIndices[0u] != pool.nextEvictChunk)
+      chunkIndices[1u] = pool.nextEvictChunk;
 
-    chunkIndices[1u] = pool.nextEvictChunk;
+    std::optional<uint32_t> evictedChunk;
 
     for (auto chunkIndex : chunkIndices) {
-      // Ensure we actually have a valid, live chunk to work with
-      if (chunkIndex >= pool.chunks.size() || !pool.pageAllocator.chunkIsAvailable(chunkIndex))
+      if (chunkIndex >= pool.chunks.size())
         continue;
 
       auto& chunk = pool.chunks[chunkIndex];
@@ -2594,31 +2739,29 @@ namespace dxvk {
         if (!resource)
           continue;
 
-        bool evicted = resource->requestEviction();
-
-        if (evicted && (heapUsage + minUnusedMemory > heapBudget + memoryEvicted)) {
+        if (resource->requestEviction()) {
           m_relocations.addResource(std::move(resource), a, DxvkAllocationMode::NoDeviceMemory);
           memoryEvicted += a->getMemoryInfo().size;
         }
-
-        if (!evicted && memoryEvicted) {
-          // Relocate other resources within the chunk to reduce fragmentation
-          m_relocations.addResource(std::move(resource), a, DxvkAllocationModes(
-            DxvkAllocationMode::NoFallback, DxvkAllocationMode::NoAllocation));
-        }
       }
 
-      // Relocate resource in the chunk we evicted from, and override any
-      // chunk that defragmentation may have picked. This greatly reduces
-      // fragmentation caused evicting a subset of resources from the chunk.
-      if (memoryEvicted) {
-        pool.pageAllocator.killChunk(chunkIndex);
+      if (memoryEvicted && !evictedChunk)
+        evictedChunk = std::make_optional(chunkIndex);
+    }
 
-        for (uint32_t i = 0u; i < pool.chunks.size(); i++) {
-          if (i != chunkIndex && pool.pageAllocator.pagesUsed(i))
-            pool.pageAllocator.reviveChunk(i);
-        }
+    // Relocate resource in the chunk we evicted from, and override any
+    // chunk that defragmentation may have picked. This greatly reduces
+    // fragmentation caused evicting a subset of resources from the chunk.
+    if (evictedChunk) {
+      pool.pageAllocator.killChunk(*evictedChunk);
+      pool.nextDefragChunk = *evictedChunk;
+
+      for (uint32_t i = 0u; i < pool.chunks.size(); i++) {
+        if (i != *evictedChunk && pool.pageAllocator.pagesUsed(i))
+          pool.pageAllocator.reviveChunk(i);
       }
+
+      moveDefragChunk(type);
     }
   }
 

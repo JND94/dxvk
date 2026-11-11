@@ -5,8 +5,9 @@ namespace dxvk {
   
   D3D11RasterizerState::D3D11RasterizerState(
           D3D11Device*                    device,
-    const D3D11_RASTERIZER_DESC2&         desc)
-  : D3D11StateObject<ID3D11RasterizerState2>(device),
+    const D3D11_RASTERIZER_DESC2&         desc,
+          Container*                      container)
+  : D3D11StateObject<ID3D11RasterizerState2, D3D11RasterizerState>(device, container),
     m_desc(desc), m_d3d10(this), m_destructionNotifier(this) {
     // Polygon mode. Determines whether the rasterizer fills
     // a polygon or renders lines connecting the vertices.
@@ -30,12 +31,22 @@ namespace dxvk {
       ? VK_FRONT_FACE_COUNTER_CLOCKWISE
       : VK_FRONT_FACE_CLOCKWISE);
 
+    // Some apps may request 16 samples, which may not be supported
+    auto sampleCountSupported = device->GetDXVKDevice()->properties().core.properties.limits.framebufferNoAttachmentsSampleCounts;
+    auto sampleCount = VkSampleCountFlags(desc.ForcedSampleCount);
+
+    if (sampleCount && !(sampleCountSupported & sampleCount))
+      Logger::warn(str::format("D3D11: Forced sample count ", sampleCount, " not supported by device."));
+
+    while (sampleCount && !(sampleCountSupported & sampleCount))
+      sampleCount >>= 1u;
+
     // In the backend we treat depth bias as a dynamic state because
     // some games like to put random/uninitialized numbers here, but
     // we do not need to enable it in case the parameters are both 0.
     m_state.setDepthClip(desc.DepthClipEnable);
     m_state.setConservativeMode(DecodeConservativeRasterizationMode(desc.ConservativeRaster));
-    m_state.setSampleCount(desc.ForcedSampleCount);
+    m_state.setSampleCount(sampleCount);
     m_state.setFlatShading(false);
     m_state.setLineMode(VK_LINE_RASTERIZATION_MODE_DEFAULT_EXT);
 
@@ -162,7 +173,7 @@ namespace dxvk {
     dstDesc.ScissorEnable         = pSrcDesc->ScissorEnable;
     dstDesc.MultisampleEnable     = pSrcDesc->MultisampleEnable;
     dstDesc.AntialiasedLineEnable = pSrcDesc->AntialiasedLineEnable;
-    dstDesc.ForcedSampleCount     = 0;
+    dstDesc.ForcedSampleCount     = pSrcDesc->ForcedSampleCount;
     dstDesc.ConservativeRaster    = D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF;
     return dstDesc;
   }

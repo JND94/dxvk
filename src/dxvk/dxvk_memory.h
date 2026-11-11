@@ -148,7 +148,6 @@ namespace dxvk {
     VkDeviceSize      memoryBudget  = 0u;
     VkMemoryHeap      properties    = { };
     bool              enforceBudget = false;
-    bool              enableEviction = false;
   };
 
 
@@ -249,6 +248,29 @@ namespace dxvk {
         info.pQueueFamilyIndices = queueFamilies.data();
       }
     }
+
+    template<typename CreateInfo>
+    bool writeBack(CreateInfo& info) const {
+      info.sharingMode = sharingMode();
+
+      if (info.sharingMode == VK_SHARING_MODE_CONCURRENT) {
+        if (info.pQueueFamilyIndices) {
+          info.queueFamilyIndexCount = std::min<uint32_t>(queueFamilies.size(), info.queueFamilyIndexCount);
+
+          for (uint32_t i = 0u; i < info.queueFamilyIndexCount; i++)
+            const_cast<uint32_t&>(info.pQueueFamilyIndices[i]) = queueFamilies.at(i);
+
+          if (info.queueFamilyIndexCount < queueFamilies.size())
+            return false;
+        } else {
+          info.queueFamilyIndexCount = queueFamilies.size();
+        }
+      } else {
+        info.queueFamilyIndexCount = 0u;
+      }
+
+      return true;
+    }
   };
 
 
@@ -341,6 +363,9 @@ namespace dxvk {
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     /// Aspect flags to include in this view
     VkImageAspectFlags aspects = 0u;
+    /// If true, allow reinterpreting the view type, otherwise
+    /// bind a null descriptor if the type does not match.
+    VkBool32 allowTypeMismatch = VK_TRUE;
     /// First mip
     uint8_t mipIndex = 0u;
     /// Number of mips
@@ -359,6 +384,7 @@ namespace dxvk {
       hash.add(uint32_t(format));
       hash.add(uint32_t(layout));
       hash.add(uint32_t(aspects));
+      hash.add(uint32_t(allowTypeMismatch));
       hash.add(uint32_t(mipIndex) | (uint32_t(mipCount) << 16));
       hash.add(uint32_t(layerIndex) | (uint32_t(layerCount) << 16));
       hash.add(uint32_t(packedSwizzle));
@@ -371,6 +397,7 @@ namespace dxvk {
           && format == other.format
           && layout == other.layout
           && aspects == other.aspects
+          && allowTypeMismatch == other.allowTypeMismatch
           && mipIndex == other.mipIndex
           && mipCount == other.mipCount
           && layerIndex == other.layerIndex
@@ -522,7 +549,7 @@ namespace dxvk {
      * \brief Increments reference count
      */
     force_inline void incRef() {
-      m_useCount.fetch_add(1u, std::memory_order_acquire);
+      m_useCount.fetch_add(1u);
     }
 
     /**
@@ -530,7 +557,7 @@ namespace dxvk {
      * Frees allocation if necessary
      */
     force_inline void decRef() {
-      if (unlikely(m_useCount.fetch_sub(1u, std::memory_order_acquire) == 1u))
+      if (unlikely(m_useCount.fetch_sub(1u) == 1u))
         free();
     }
 
@@ -1104,6 +1131,8 @@ namespace dxvk {
       DxvkRelocationEntry,
       RelocationOrdering>       m_entries;
 
+    DxvkResourceMemoryInfo      m_lastKey = {};
+
   };
 
 
@@ -1140,6 +1169,10 @@ namespace dxvk {
     constexpr static VkBufferUsageFlags DescriptorBufferUsage =
       VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
       VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT;
+
+    // Buffer usage flag for descriptor heaps
+    constexpr static VkBufferUsageFlags DescriptorHeapUsage =
+      VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT;
   public:
     
     DxvkMemoryAllocator(DxvkDevice* device);
@@ -1426,6 +1459,11 @@ namespace dxvk {
     uint32_t countEmptyChunksInPool(
       const DxvkMemoryPool&       pool) const;
 
+    void freeEmptyChunksForType(
+            DxvkMemoryType&       type,
+            VkDeviceSize          allocationSize,
+            high_resolution_clock::time_point time);
+
     void freeEmptyChunksInHeap(
       const DxvkMemoryHeap&       heap,
             VkDeviceSize          allocationSize,
@@ -1458,7 +1496,7 @@ namespace dxvk {
       const DxvkDeviceMemory&     memory,
       const DxvkAllocationInfo&   allocationInfo);
 
-    DxvkResourceAllocation* createAllocation(
+    DxvkResourceAllocation* allocateSparsePageTable(
             DxvkSparsePageTable*  sparsePageTable,
       const DxvkAllocationInfo&   allocationInfo);
 

@@ -89,6 +89,11 @@ namespace dxvk {
     void SynchronizeCsThread(
             uint64_t                          SequenceNumber);
 
+    void ExecuteFlush(
+            GpuFlushType                FlushType,
+            HANDLE                      hEvent,
+            BOOL                        Synchronize);
+
     D3D10Multithread& GetMultithread() {
         return m_multithread;
     }
@@ -121,7 +126,6 @@ namespace dxvk {
 
     Rc<sync::CallbackFence> m_submissionFence;
     uint64_t                m_submissionId = 0ull;
-    DxvkSubmitStatus        m_submitStatus;
 
     uint64_t                m_flushSeqNum = 0ull;
     GpuFlushTracker         m_flushTracker;
@@ -139,6 +143,8 @@ namespace dxvk {
     D3DDestructionNotifier  m_destructionNotifier;
 
     std::string             m_flushReason;
+
+    bool                    m_hasPendingUnresolvedPass = false;
 
     HRESULT MapBuffer(
             D3D11Buffer*                pResource,
@@ -175,8 +181,7 @@ namespace dxvk {
 
     void SynchronizeDevice();
 
-    void EndFrame(
-            Rc<DxvkLatencyTracker>      LatencyTracker);
+    void EndFrame();
     
     bool WaitForResource(
       const DxvkPagedResource&          Resource,
@@ -202,17 +207,19 @@ namespace dxvk {
     void ConsiderFlush(
             GpuFlushType                FlushType);
 
-    void ExecuteFlush(
-            GpuFlushType                FlushType,
-            HANDLE                      hEvent,
-            BOOL                        Synchronize);
-
     void ThrottleAllocation();
 
     void ThrottleDiscard(
             VkDeviceSize                Size);
 
-    void NotifyRenderPassBoundary();
+    void NotifyRenderPassBoundary(
+            bool                        IsMultisampled);
+
+    void NotifyResolve();
+
+    void RequestFlush(
+            D3D11_CONTEXT_TYPE          ContextType,
+            HANDLE                      hEvent);
 
     DxvkStagingBufferStats GetStagingMemoryStatistics();
 

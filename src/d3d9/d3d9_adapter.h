@@ -4,6 +4,7 @@
 
 #include "d3d9_options.h"
 #include "d3d9_format.h"
+#include "d3d9_bridge.h"
 
 #include "../dxvk/dxvk_adapter.h"
 
@@ -20,6 +21,7 @@ namespace dxvk {
     D3D9Adapter(
             D3D9InterfaceEx* pParent,
       const D3D9ON12_ARGS*   p9On12Args,
+            Rc<DxvkInstance> Instance,
             Rc<DxvkAdapter>  Adapter,
             UINT             Ordinal,
             UINT             DisplayIndex);
@@ -98,9 +100,18 @@ namespace dxvk {
       return m_9On12Args;
     }
 
-    bool IsExtended() const;
+    void RefreshFormatsTable() const;
 
-    bool IsD3D8Compatible() const;
+    bool IsD3DCompatibile(D3DCompatibility d3dCompatibility) const;
+
+    force_inline void incRef() {
+      m_refCount.fetch_add(1u);
+    }
+
+    force_inline void decRef() {
+      if (m_refCount.fetch_sub(1u) == 1u)
+        delete this;
+    }
 
   private:
 
@@ -137,9 +148,13 @@ namespace dxvk {
 
     void CacheIdentifierInfo();
 
+    std::atomic<uint32_t>         m_refCount = { 0u };
+
     D3D9InterfaceEx*              m_parent;
 
     Rc<DxvkAdapter>               m_adapter;
+    DxvkDeviceCapabilities        m_caps;
+
     UINT                          m_ordinal;
     UINT                          m_displayIndex;
 
@@ -153,7 +168,7 @@ namespace dxvk {
     std::vector<D3DDISPLAYMODEEX>            m_modes;
     D3D9Format                               m_modeCacheFormat;
 
-    std::unique_ptr<const D3D9VkFormatTable> m_d3d9Formats;
+    std::unique_ptr<D3D9VkFormatTable>       m_d3d9Formats;
 
   };
 

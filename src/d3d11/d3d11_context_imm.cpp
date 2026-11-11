@@ -164,27 +164,17 @@ namespace dxvk {
 
 
   void STDMETHODCALLTYPE D3D11ImmediateContext::Flush() {
-    D3D10DeviceLock lock = LockContext();
-
-    if (unlikely(m_device->debugFlags().test(DxvkDebugFlag::Capture)))
-      m_flushReason = "Explicit Flush";
-
-    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
+    RequestFlush(D3D11_CONTEXT_TYPE_ALL, nullptr);
   }
 
 
   void STDMETHODCALLTYPE D3D11ImmediateContext::Flush1(
           D3D11_CONTEXT_TYPE          ContextType,
           HANDLE                      hEvent) {
-    D3D10DeviceLock lock = LockContext();
-
-    if (unlikely(m_device->debugFlags().test(DxvkDebugFlag::Capture)))
-      m_flushReason = "Explicit Flush";
-
-    ExecuteFlush(GpuFlushType::ExplicitFlush, hEvent, true);
+    RequestFlush(ContextType, hEvent);
   }
-  
-  
+
+
   HRESULT STDMETHODCALLTYPE D3D11ImmediateContext::Signal(
           ID3D11Fence*                pFence,
           UINT64                      Value) {
@@ -204,7 +194,7 @@ namespace dxvk {
     if (unlikely(m_device->debugFlags().test(DxvkDebugFlag::Capture)))
       m_flushReason = "Fence signal";
 
-    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
+    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, m_parent->Is11on12Device());
     return S_OK;
   }
 
@@ -221,7 +211,7 @@ namespace dxvk {
     if (unlikely(m_device->debugFlags().test(DxvkDebugFlag::Capture)))
       m_flushReason = "Fence wait";
 
-    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
+    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, m_parent->Is11on12Device());
 
     EmitCs([
       cFence = fence->GetFence(),
@@ -876,8 +866,7 @@ namespace dxvk {
   }
   
   
-  void D3D11ImmediateContext::EndFrame(
-          Rc<DxvkLatencyTracker>      LatencyTracker) {
+  void D3D11ImmediateContext::EndFrame() {
     D3D10DeviceLock lock = LockContext();
 
     // Don't keep draw buffers alive indefinitely. This cannot be
@@ -885,13 +874,8 @@ namespace dxvk {
     // flush, so no state changes are allowed to happen there.
     SetDrawBuffers(nullptr, nullptr);
 
-    EmitCs<false>([
-      cTracker = std::move(LatencyTracker)
-    ] (DxvkContext* ctx) {
+    EmitCs<false>([] (DxvkContext* ctx) {
       ctx->endFrame();
-
-      if (cTracker && cTracker->needsAutoMarkers())
-        ctx->endLatencyTracking(cTracker);
     });
   }
 
@@ -1103,14 +1087,19 @@ namespace dxvk {
           GpuFlushType                FlushType,
           HANDLE                      hEvent,
           BOOL                        Synchronize) {
-    bool synchronizeSubmission = Synchronize && m_parent->Is11on12Device();
-
-    if (synchronizeSubmission)
-      m_submitStatus.result = VK_NOT_READY;
-
     // Exit early if there's nothing to do
-    if (!GetPendingCsChunks() && !hEvent)
+    if (!GetPendingCsChunks() && !hEvent) {
+      if (Synchronize)
+        m_device->waitForSubmission(m_submissionId);
       return;
+    }
+
+    m_hasPendingUnresolvedPass = false;
+
+    // Throttle submissions to avoid queueing up too many command
+    // buffers in case the app never presents
+    if (m_submissionId >= MaxNumQueuedCommandBuffers)
+      m_device->waitForSubmission(m_submissionId - MaxNumQueuedCommandBuffers);
 
     // Unbind unused resources
     ApplyDirtyNullBindings();
@@ -1127,7 +1116,6 @@ namespace dxvk {
     EmitCs<false>([
       cSubmissionFence  = m_submissionFence,
       cSubmissionId     = submissionId,
-      cSubmissionStatus = synchronizeSubmission ? &m_submitStatus : nullptr,
       cStagingFence     = m_stagingBufferFence,
       cStagingMemory    = GetStagingMemoryStatistics().allocatedTotal,
       cFlushReason      = std::exchange(m_flushReason, std::string())
@@ -1136,7 +1124,7 @@ namespace dxvk {
 
       ctx->signal(cSubmissionFence, cSubmissionId);
       ctx->signal(cStagingFence, cStagingMemory);
-      ctx->flushCommandList(&debugLabel, cSubmissionStatus);
+      ctx->flushCommandList(&debugLabel, cSubmissionId);
     });
 
     FlushCsChunk();
@@ -1147,8 +1135,8 @@ namespace dxvk {
 
     // If necessary, block calling thread until the
     // Vulkan queue submission is performed.
-    if (synchronizeSubmission)
-      m_device->waitForSubmission(&m_submitStatus);
+    if (Synchronize)
+      m_device->waitForSubmission(submissionId);
 
     // Free local staging buffer so that we don't
     // end up with a persistent allocation
@@ -1195,11 +1183,14 @@ namespace dxvk {
   }
 
 
-  void D3D11ImmediateContext::NotifyRenderPassBoundary() {
+  void D3D11ImmediateContext::NotifyRenderPassBoundary(bool IsMultisampled) {
     // Doing this makes it less likely to flush during render passes
     ConsiderFlush(GpuFlushType::ImplicitWeakHint);
 
     if (m_device->perfHints().preferRenderPassOps) {
+      // Make sure that explicit flushes get ignored until the next resolve
+      m_hasPendingUnresolvedPass = m_hasPendingUnresolvedPass || IsMultisampled;
+
       // On tilers, we want to avoid submitting during a render pass or a sequence
       // of render passes as much as possible, but if a submission request has been
       // rejected before, we should do it now in order to avoid read-back delays.
@@ -1208,6 +1199,30 @@ namespace dxvk {
       if (pending != GpuFlushType::None)
         ExecuteFlush(pending, nullptr, false);
     }
+  }
+
+
+  void D3D11ImmediateContext::NotifyResolve() {
+    m_hasPendingUnresolvedPass = false;
+  }
+
+
+  void D3D11ImmediateContext::RequestFlush(
+          D3D11_CONTEXT_TYPE          ContextType,
+          HANDLE                      hEvent) {
+    D3D10DeviceLock lock = LockContext();
+
+    // If we're in tiler mode and a render pass hasn't been resolved yet,
+    // ignore explicit flushes. This is a very dirty heuristic to work
+    // around some Unity Engine performance issues.
+    if (!m_parent->Is11on12Device() && !hEvent
+     && (m_hasPendingUnresolvedPass || m_parent->GetOptions()->ignoreExplicitFlush))
+      return;
+
+    if (unlikely(m_device->debugFlags().test(DxvkDebugFlag::Capture)))
+      m_flushReason = hEvent ? "Explicit Flush (with event)" : "Explicit Flush";
+
+    ExecuteFlush(GpuFlushType::ExplicitFlush, hEvent, m_parent->Is11on12Device());
   }
 
 

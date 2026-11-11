@@ -15,8 +15,10 @@ namespace dxvk {
 
 
   bool DxvkShaderLinkage::eq(const DxvkShaderLinkage& other) const {
-    bool eq = fsDualSrcBlend == other.fsDualSrcBlend
-           && fsFlatShading == other.fsFlatShading;
+    bool eq = fsDualSrcBlend  == other.fsDualSrcBlend
+           && fsFlatShading   == other.fsFlatShading
+           && sampleLocations == other.sampleLocations
+           && semanticIo      == other.semanticIo;
 
     if (eq) {
       eq = prevStageOutputs.getVarCount() == other.prevStageOutputs.getVarCount();
@@ -40,6 +42,8 @@ namespace dxvk {
     DxvkHashState hash;
     hash.add(uint32_t(fsDualSrcBlend));
     hash.add(uint32_t(fsFlatShading));
+    hash.add(uint32_t(sampleLocations));
+    hash.add(uint32_t(semanticIo));
 
     for (uint32_t i = 0; i < prevStageOutputs.getVarCount(); i++)
       hash.add(prevStageOutputs.getVar(i).hash());
@@ -74,13 +78,16 @@ namespace dxvk {
 
   
 
-  DxvkShaderStageInfo::DxvkShaderStageInfo(const DxvkDevice* device)
+  DxvkShaderStageInfo::DxvkShaderStageInfo(const DxvkDevice* device, const DxvkPipelineLayout* layout)
   : m_device(device) {
-
+    if (m_device->canUseDescriptorHeap()) {
+      m_mapping = layout->getMappingInfo();
+      m_next = &m_mapping;
+    }
   }
 
   void DxvkShaderStageInfo::addStage(
-          VkShaderStageFlagBits   stage,
+    const DxvkShaderMetadata&     metadata,
           SpirvCodeBuffer&&       code,
     const VkSpecializationInfo*   specInfo) {
     // Take ownership of the SPIR-V code buffer
@@ -88,13 +95,13 @@ namespace dxvk {
     codeBuffer = std::move(code);
 
     auto& moduleInfo = m_moduleInfos[m_stageCount].moduleInfo;
-    moduleInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    moduleInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, m_next };
     moduleInfo.codeSize = codeBuffer.size();
     moduleInfo.pCode = codeBuffer.data();
 
     auto& stageInfo = m_stageInfos[m_stageCount];
     stageInfo = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &moduleInfo };
-    stageInfo.stage = stage;
+    stageInfo.stage = metadata.stage;
     stageInfo.pName = "main";
     stageInfo.pSpecializationInfo = specInfo;
 
@@ -103,14 +110,14 @@ namespace dxvk {
   
 
   void DxvkShaderStageInfo::addStage(
-          VkShaderStageFlagBits   stage,
+    const DxvkShaderMetadata&     metadata,
     const VkShaderModuleIdentifierEXT& identifier,
     const VkSpecializationInfo*   specInfo) {
     // Copy relevant bits of the module identifier
     uint32_t identifierSize = std::min(identifier.identifierSize, VK_MAX_SHADER_MODULE_IDENTIFIER_SIZE_EXT);
 
     auto& moduleId = m_moduleInfos[m_stageCount].moduleIdentifier;
-    moduleId.createInfo = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT };
+    moduleId.createInfo = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT, m_next };
     moduleId.createInfo.identifierSize = identifierSize;
     moduleId.createInfo.pIdentifier = moduleId.data.data();
     std::memcpy(moduleId.data.data(), identifier.identifier, identifierSize);
@@ -119,7 +126,7 @@ namespace dxvk {
     auto& stageInfo = m_stageInfos[m_stageCount];
     stageInfo = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
     stageInfo.pNext = &moduleId.createInfo;
-    stageInfo.stage = stage;
+    stageInfo.stage = metadata.stage;
     stageInfo.pName = "main";
     stageInfo.pSpecializationInfo = specInfo;
 
@@ -150,6 +157,9 @@ namespace dxvk {
 
   bool DxvkShaderPipelineLibraryKey::eq(
     const DxvkShaderPipelineLibraryKey& other) const {
+    if (m_shaders.size() != other.m_shaders.size())
+      return false;
+
     bool eq = true;
 
     for (uint32_t i = 0; i < m_shaders.size() && eq; i++)
@@ -301,7 +311,7 @@ namespace dxvk {
 
   DxvkShaderPipelineLibraryHandle DxvkShaderPipelineLibrary::compileShaderPipeline(
           VkPipelineCreateFlags2                flags) {
-    DxvkShaderStageInfo stageInfo(m_device);
+    DxvkShaderStageInfo stageInfo(m_device, getPipelineLibraryLayout());
     VkShaderStageFlags stageMask = getShaderStages();
 
     { std::lock_guard lock(m_identifierMutex);
@@ -317,7 +327,7 @@ namespace dxvk {
           if (!identifier->identifierSize)
             return { VK_NULL_HANDLE, 0 };
 
-          stageInfo.addStage(stage, *identifier, nullptr);
+          stageInfo.addStage(getShaderMetadata(stage), *identifier, nullptr);
         } else {
           // Decompress code and generate identifier as needed
           SpirvCodeBuffer spirvCode = this->getShaderCode(stage);
@@ -325,7 +335,7 @@ namespace dxvk {
           if (!identifier->identifierSize)
             this->generateModuleIdentifierLocked(identifier, spirvCode);
 
-          stageInfo.addStage(stage, std::move(spirvCode), nullptr);
+          stageInfo.addStage(getShaderMetadata(stage), std::move(spirvCode), nullptr);
         }
 
         stages &= stages - 1;
@@ -402,6 +412,9 @@ namespace dxvk {
     VkPipelineCreateFlags2CreateInfo flagsInfo = { VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO, &rtInfo };
     flagsInfo.flags = VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR | flags;
 
+    if (m_device->canUseDescriptorHeap())
+      flagsInfo.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
+
     if (m_device->canUseDescriptorBuffer())
       flagsInfo.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
 
@@ -415,7 +428,7 @@ namespace dxvk {
     info.pViewportState       = &vpInfo;
     info.pRasterizationState  = &rsInfo;
     info.pDynamicState        = &dyInfo;
-    info.layout               = m_layout->getLayout(DxvkPipelineLayoutType::Independent)->getPipelineLayout();
+    info.layout               = getPipelineLibraryLayout()->getPipelineLayout();
     info.basePipelineIndex    = -1;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
@@ -502,6 +515,9 @@ namespace dxvk {
     VkPipelineCreateFlags2CreateInfo flagsInfo = { VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO, &rtInfo };
     flagsInfo.flags = VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR | flags;
 
+    if (m_device->canUseDescriptorHeap())
+      flagsInfo.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
+
     if (m_device->canUseDescriptorBuffer())
       flagsInfo.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
 
@@ -538,12 +554,15 @@ namespace dxvk {
     VkPipelineCreateFlags2CreateInfo flagsInfo = { VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
     flagsInfo.flags = flags;
 
+    if (m_device->canUseDescriptorHeap())
+      flagsInfo.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
+
     if (m_device->canUseDescriptorBuffer())
       flagsInfo.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
 
     VkComputePipelineCreateInfo info = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
     info.stage        = *stageInfo.getStageInfos();
-    info.layout       = m_layout->getLayout(DxvkPipelineLayoutType::Merged)->getPipelineLayout();
+    info.layout       = getPipelineLibraryLayout()->getPipelineLayout();
     info.basePipelineIndex = -1;
 
     if (flagsInfo.flags)
@@ -574,6 +593,20 @@ namespace dxvk {
       : DxvkPipelineLayoutType::Independent;
 
     return shader->getCode(m_layout->getBindingMap(layoutType), nullptr);
+  }
+
+
+  DxvkShaderMetadata DxvkShaderPipelineLibrary::getShaderMetadata(
+          VkShaderStageFlagBits         stage) const {
+    DxvkShader* shader = getShader(stage);
+
+    if (!shader) {
+      DxvkShaderMetadata result = {};
+      result.stage = stage;
+      return result;
+    }
+
+    return shader->metadata();
   }
 
 
@@ -701,9 +734,12 @@ namespace dxvk {
         const auto& prevShaderMeta = prevShader->metadata();
         const auto& currShaderMeta = currShader->metadata();
 
+        bool semanticIo = currShaderMeta.flags.test(DxvkShaderFlag::SemanticIo)
+                       && prevShaderMeta.flags.test(DxvkShaderFlag::SemanticIo);
+
         if (!DxvkShaderIo::checkStageCompatibility(
             currShaderMeta.stage, currShaderMeta.inputs,
-            prevShaderMeta.stage, prevShaderMeta.outputs))
+            prevShaderMeta.stage, prevShaderMeta.outputs, semanticIo))
           return false;
       }
     }
@@ -730,13 +766,11 @@ namespace dxvk {
     if (needsPosition && !metadata.flags.test(DxvkShaderFlag::ExportsPosition))
       return false;
 
-    // Spec constant selectors are only supported in graphics
-    if (metadata.specConstantMask & (1u << MaxNumSpecConstants))
-      return metadata.stage != VK_SHADER_STAGE_COMPUTE_BIT;
+    // Dynamic spec constants are only supported in graphics
+    if (metadata.specConstantMask && metadata.stage == VK_SHADER_STAGE_COMPUTE_BIT)
+      return false;
 
-    // Always late-compile shaders with spec constants
-    // that don't use the spec constant selector
-    return !metadata.specConstantMask;
+    return true;
   }
 
 
@@ -753,6 +787,15 @@ namespace dxvk {
 
     return features.vk13.pipelineCreationCacheControl
         && features.extShaderModuleIdentifier.shaderModuleIdentifier;
+  }
+
+
+  const DxvkPipelineLayout* DxvkShaderPipelineLibrary::getPipelineLibraryLayout() const {
+    DxvkPipelineLayoutType type = m_shaders.findShader(VK_SHADER_STAGE_COMPUTE_BIT)
+      ? DxvkPipelineLayoutType::Merged
+      : DxvkPipelineLayoutType::Independent;
+
+    return m_layout->getLayout(type);
   }
 
 }

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <fstream>
 #include <sstream>
@@ -129,7 +130,7 @@ namespace dxvk {
     }} },
     /* Fifa '19+: Binds typed buffer SRV to shader *
      * that expects raw/structured buffer SRV      */
-    { R"(\\FIFA(19|[2-9][0-9])(_demo)?\.exe$)", {{
+    { R"(\\FIFA(19|20|21|22)(_demo)?\.exe$)", {{
       { "dxvk.useRawSsbo",                  "True" },
     }} },
     /* Resident Evil 2/3: Ignore WaW hazards      */
@@ -143,6 +144,10 @@ namespace dxvk {
     /* Call of Duty WW2                           */
     { R"(\\s2_sp64_ship\.exe$)", {{
       { "dxgi.hideNvidiaGpu",              "False" },
+    }} },
+    /* Call of Duty Ghosts */
+    { R"(\\iw6sp64_ship\.exe$)", {{
+      { "dxvk.zeroShaderScratchMemory",     "True" },
     }} },
     /* Need for Speed 2015                        */
     { R"(\\NFS16\.exe$)", {{
@@ -175,6 +180,16 @@ namespace dxvk {
     }} },
     /* H2M-Mod - Modern Warfare Remastered        */
     { R"(\\h2m-mod\.exe$)", {{
+      { "dxgi.customVendorId",              "10de" },
+    }} },
+    /* HMW-Mod - Modern Warfare Remastered        *
+     * AMD AGS crash                              */
+    { R"(\\hmw-mod\.exe$)", {{
+      { "dxgi.customVendorId",              "10de" },
+    }} },
+    /* Infinite Warfare                           *
+     * AMD AGS crash                              */
+    { R"(\\iw7(_ship|-mod)\.exe$)", {{
       { "dxgi.customVendorId",              "10de" },
     }} },
     /* Modern Warfare 2 Campaign Remastered       *
@@ -260,14 +275,15 @@ namespace dxvk {
     { R"(\\armoredwarfare\.exe$)", {{
       { "d3d11.cachedDynamicResources",        "c" },
     }} },
-    /* Nioh 2                                     */
+    /* Nioh 2 - Fixes some fires looking glitchy  */
     { R"(\\nioh2\.exe$)", {{
       { "dxgi.deferSurfaceCreation",        "True" },
+      { "dxvk.zeroMappedMemory",            "True" },
     }} },
     /* Crazy Machines 3 - crashes on long device  *
      * descriptions                               */
     { R"(\\cm3\.exe$)", {{
-      { "dxgi.customDeviceDesc",            "DXVK Device" },
+      { "dxgi.customDeviceDesc",     "DXVK Device" },
     }} },
     /* World of Final Fantasy: Broken and useless use     *
      * of 4x MSAA throughout the renderer. Water doesn't  *
@@ -275,7 +291,7 @@ namespace dxvk {
      * us plebs aren't worthy of the divine pixel liquid. */
     { R"(\\WOFF\.exe$)", {{
       { "d3d11.disableMsaa",                "True" },
-      { "dxgi.customDeviceDesc",            "DXVK Device" },
+      { "dxgi.customDeviceDesc",     "DXVK Device" },
     }} },
     /* Mary Skelter 2 - Broken MSAA               */
     { R"(\\MarySkelter2\.exe$)", {{
@@ -347,6 +363,11 @@ namespace dxvk {
      * Games speed up above 60 fps                */
     { R"(\\MSFC\.exe$)", {{
       { "dxgi.maxFrameRate",                 "-60" },
+    }} },
+    /* The Evil Within 2 *
+    * Game speeds up above 120 fps */
+    { R"(\\TEW2\.exe$)", {{
+      { "dxgi.maxFrameRate",                "-120" },
     }} },
     /* Sonic Frontiers - flickering shadows and   *
      * vegetation when GPU-bound                  */
@@ -477,6 +498,22 @@ namespace dxvk {
     { R"(\\Rapture_Release\.exe$)", {{
       { "d3d11.cachedDynamicResources",        "a" },
     }} },
+    /* Total War Pharaoh Dynasties: Broken menu   *
+     * because the game doesn't manage to respect *
+     * pitch for an A8_UNORM image. Resolves are  *
+     * not needed because the game dynamically    *
+     * checks sample count in affected shaders.   *
+     * Compute shaders have LDS race conditions.  */
+    { R"(\\Pharaoh\.exe$)", {{
+      { "d3d11.disableDirectImageMapping",  "True" },
+      { "d3d11.forceComputeLdsBarriers",    "True" },
+      { "dxvk.enableImplicitResolves",     "False" },
+      { "dxvk.zeroMappedMemory",            "True" },
+    }} },
+    /* Skyrim Speshul Edition                     */
+    { R"(\\SkyrimSE\.exe$)", {{
+      { "d3d11.cachedDynamicResources",        "a" },
+    }} },
 
     /**********************************************/
     /* D3D9 GAMES                                 */
@@ -484,7 +521,6 @@ namespace dxvk {
 
     /* A Hat in Time                              */
     { R"(\\HatinTimeGame\.exe$)", {{
-      { "d3d9.strictPow",                  "False" },
       { "d3d9.lenientClear",                "True" },
     }} },
     /* Anarchy Online                             */
@@ -568,12 +604,18 @@ namespace dxvk {
      * spec-constantly chose the sampler type     *
      * automagically.                             */
       { "d3d9.forceSamplerTypeSpecConstants", "True" },
+    /* The game passes incorrect values when      *
+     * locking a vertex buffer causing it to      *
+     * render "behind" the initial loading screen */
+      { "d3d9.ignoreDefaultBufferLockRange", "True" },
     }} },
     /* Counter Strike: Global Offensive
        Needs NVAPI to avoid a forced AO + Smoke
-       exploit so we must force AMD vendor ID.    */
+       exploit so we must force AMD vendor ID.
+       Also writes to buffer after unlocking it. */
     { R"(\\csgo\.exe$)", {{
       { "d3d9.hideNvidiaGpu",               "True" },
+      { "d3d9.forceDrawTimeBufferUpload",   "True" },
     }} },
     /* Vampire - The Masquerade Bloodlines        */
     { R"(\\vampire\.exe$)", {{
@@ -712,7 +754,6 @@ namespace dxvk {
     /* BlazBlue Centralfiction                    */
     { R"(\\BBCF\.exe$)", {{
       { "d3d9.floatEmulation",            "Strict" },
-      { "d3d9.textureMemory",                  "0" },
     }} },
     /* Limbo                                      */
     { R"(\\limbo\.exe$)", {{
@@ -734,8 +775,8 @@ namespace dxvk {
      * Resolution change crash and cached         *
      * dynamic buffers for performance reasons    */
     { R"(\\eoa\.exe$)", {{
-      { "d3d9.cachedWriteOnlyBuffers",        "True" },
-      { "d3d9.countLosableResources",         "False" },
+      { "d3d9.cachedWriteOnlyBuffers",      "True" },
+      { "d3d9.countLosableResources",      "False" },
     }} },
     /* Supreme Commander & Forged Alliance Forever */
     { R"(\\(SupremeCommander|ForgedAlliance)\.exe$)", {{
@@ -919,9 +960,9 @@ namespace dxvk {
      * in mod New Vegas Reloaded. Nvidia path in  *
      * same mod use NvAPI_D3D9_StretchRectEx for  *
      * depth buffer resolves                      */
-    { R"(\\FalloutNV(Launcher)?\.exe$)", {{
+    { R"(\\Fallout( -)? New Vegas.*\\(FalloutNV)?(Launcher)?\.exe$)", {{
       { "d3d9.floatEmulation",            "Strict" },
-      { "d3d9.hideNvidiaGpu",               "True" },
+      { "d3d9.customVendorId",              "1002" },
     }} },
     /* Dungeons and Dragons: Dragonshard          *
      * Massive FPS decreases in some scenes       */
@@ -978,10 +1019,6 @@ namespace dxvk {
      * improve perf on all hardware.              */
     { R"(\\(FarCry2|farcry2game)\.exe$)", {{
       { "d3d9.cachedWriteOnlyBuffers",      "True" },
-    }} },
-    /* Dark Sector - Crashes in places            */
-    { R"(\\DS\.exe$)", {{
-      { "d3d9.textureMemory",                  "0" },
     }} },
     /* Arcana Heart 3 Love Max + Xtend version    *
      * Game speed is too fast above 60 fps        */
@@ -1116,7 +1153,44 @@ namespace dxvk {
     { R"(\\RRU(_demo)?\.exe$)", {{
       { "dxvk.zeroMappedMemory",            "True" },
     }} },
-
+    /* Sims 3                                     *
+     * Worse shadow quality on unknown AMD cards  */
+    { R"(\\TS3(W)?\.exe$)", {{
+      { "d3d9.customVendorId",              "10de" },
+      { "d3d9.customDeviceId",              "1080" },
+      { "d3d9.customDeviceDesc", "Geforce GTX 580" },
+    }} },
+    /* Sid Meier's Pirates!: Live the Life        *
+     * Fixes a crash on resolution change         */
+    { R"(\\Pirates!\.exe$)", {{
+      { "d3d9.countLosableResources",      "False" },
+    }} },
+    /* Warhammer 40,000: Dawn of War DE           *
+     * Fixes occasional vertex explosions         */
+    { R"(\\W40k(_gog)?\.exe$)", {{
+      { "dxvk.zeroMappedMemory",            "True" },
+    }} },
+    /* Insurgency
+       Writes to buffer after unlocking it. */
+    { R"(\\insurgency\.exe$)", {{
+      { "d3d9.forceDrawTimeBufferUpload",   "True" },
+    }} },
+    /* SimCity Societies: Destinations            *
+     * Needs depth format cube texture support    *
+     * in order to start up properly              */
+    { R"(\\SCSDestinations\.exe$)", {{
+      { "d3d9.supportCubeDepthFormats",     "True" },
+    }} },
+    /* Splinter Cell: Double Agent                *
+     * AMD path have a semi or fully black world  */
+    { R"(\\(SplinterCell4|SCDA_online)\.exe$)", {{
+      { "d3d9.hideAmdGpu",                  "True" },
+    }} },
+    /* Splinter Cell: Chaos Theory                *
+     * Passes incorrect values when locking a vertex buffer  */
+    { R"(\\splintercell3\.exe$)", {{
+      { "d3d9.ignoreDefaultBufferLockRange", "True" },
+    }} },
 
     /**********************************************/
     /* D3D8 GAMES                                 */
@@ -1253,11 +1327,11 @@ namespace dxvk {
       { "d3d9.maxFrameRate",                 "-60" },
     }} },
     /* Rayman 3: Hoodlum Havoc                    *
-     * Missing geometry and textures without      *
-     * legacy DISCARD behavior                    */
+     * Fixes missing geometry and textures        *
+     * as well as some broken effects             */
     { R"(\\Rayman3\.exe$)", {{
       { "d3d9.maxFrameRate",                 "-60" },
-      { "d3d8.forceLegacyDiscard",          "True" },
+      { "d3d8.forceLegacyBuffers",          "True" },
     }} },
     /* Tom Clancy's Splinter Cell                 *
      * Fixes shadow buffers, broken physics       *
@@ -1307,10 +1381,9 @@ namespace dxvk {
       { "d3d9.modeCountCompatibility",      "True" },
     }} },
     /* Top Spin (2005)                            *
-     * Missing geometry and textures without      *
-     * legacy DISCARD behavior                    */
+     * Fixes missing geometry and textures        */
     { R"(\\TopSpin\.exe$)", {{
-      { "d3d8.forceLegacyDiscard",          "True" },
+      { "d3d8.forceLegacyBuffers",          "True" },
     }} },
     /* Lego Racers 2 - Hits an incredible amount  *
      * of queue syncs with direct buffer mapping  */
@@ -1322,6 +1395,26 @@ namespace dxvk {
     { R"(\\Smash up Derby\\cars\.exe$)", {{
       { "d3d9.allowDirectBufferMapping",   "False" },
     }} },
+    /* Age of Pirates: Caribbean Tales            *
+     * Crashes due to a texture UAF otherwise     */
+    { R"(\\(Age of Pirates|Sea Dogs).*Caribbean Tales\\ENGINE\.exe$)", {{
+      { "d3d8.textureUAFGuard",             "True" },
+    }} },
+    /* Age of Pirates 2: City of Abandoned Ships  *
+     * Crashes due to a texture UAF otherwise     */
+    { R"(\\(Age of Pirates|Sea Dogs).*City of Abandoned Ships\\START\.exe$)", {{
+      { "d3d8.textureUAFGuard",             "True" },
+    }} },
+    /* Mafia - Improves poor texture filtering    */
+    { R"(\\Mafia\\Game\.exe$)", {{
+      { "d3d9.samplerAnisotropy",             "16" },
+    }} },
+    /* Manhunt                                    *
+     * Broken AI behavior above 60 FPS (game bug) */
+    { R"(\\manhunt\.exe$)", {{
+      { "d3d9.maxFrameRate",                 "-60" },
+    }} },
+
   };
 
 

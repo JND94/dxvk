@@ -1,7 +1,5 @@
 #include "dxvk_device.h"
 #include "dxvk_instance.h"
-#include "dxvk_latency_builtin.h"
-#include "dxvk_latency_reflex.h"
 #include "dxvk_shader_cache.h"
 #include "dxvk_shader_ir.h"
 
@@ -11,7 +9,7 @@ namespace dxvk {
     const Rc<DxvkInstance>&         instance,
     const Rc<DxvkAdapter>&          adapter,
     const Rc<vk::DeviceFn>&         vkd,
-    const DxvkDeviceFeatures&       features,
+    const DxvkDeviceCapabilities&   caps,
     const DxvkDeviceQueueSet&       queues,
     const DxvkQueueCallback&        queueCallback)
   : m_options           (instance->options()),
@@ -20,10 +18,11 @@ namespace dxvk {
     m_vkd               (vkd),
     m_debugFlags        (instance->debugFlags()),
     m_queues            (queues),
-    m_features          (features),
-    m_properties        (adapter->deviceProperties()),
+    m_features          (caps.getFeatures()),
+    m_properties        (caps.getProperties()),
     m_perfHints         (getPerfHints()),
     m_objects           (this),
+    m_checkpoints       (this),
     m_submissionQueue   (this, queueCallback) {
 
     if (adapter->kmtLocal()) {
@@ -39,6 +38,8 @@ namespace dxvk {
 
     if (env::getEnvVar("DXVK_SHADER_CACHE") != "0" && DxvkShader::getShaderDumpPath().empty())
       m_shaderCache = DxvkShaderCache::getInstance();
+
+    logBindingModel();
   }
   
   
@@ -119,21 +120,20 @@ namespace dxvk {
   }
 
 
-  bool DxvkDevice::canUsePipelineCacheControl() const {
-    // Don't bother with this unless the device also supports shader module
-    // identifiers, since decoding and hashing the shaders is slow otherwise
-    // and likely provides no benefit over linking pipeline libraries.
-    return m_features.vk13.pipelineCreationCacheControl
-        && m_features.extShaderModuleIdentifier.shaderModuleIdentifier
-        && m_options.enableGraphicsPipelineLibrary != Tristate::True;
-  }
-
-
   bool DxvkDevice::canUseSampleLocations(VkSampleCountFlags samples) const {
     return (m_features.extSampleLocations)
         && (m_features.extExtendedDynamicState3.extendedDynamicState3SampleLocationsEnable)
         && (m_properties.extSampleLocations.variableSampleLocations)
         && (m_properties.extSampleLocations.sampleLocationSampleCounts & samples) == samples;
+  }
+
+
+  bool DxvkDevice::canUseMixedSamples(const Rc<DxvkShader>& shader) const {
+    if (!shader || !(shader->metadata().flags.test(DxvkShaderFlag::UsesSampleMask)))
+      return false;
+
+    return m_features.amdMixedAttachmentSamples
+        || m_features.nvFramebufferMixedSamples;
   }
 
 
@@ -186,12 +186,7 @@ namespace dxvk {
   
   
   Rc<DxvkCommandList> DxvkDevice::createCommandList() {
-    Rc<DxvkCommandList> cmdList = m_recycledCommandLists.retrieveObject();
-    
-    if (cmdList == nullptr)
-      cmdList = new DxvkCommandList(this);
-    
-    return cmdList;
+    return m_recycledCommandLists.retrieveObject(this);
   }
 
 
@@ -263,7 +258,7 @@ namespace dxvk {
           VkDeviceSize                    pushDataSize,
           uint32_t                        bindingCount,
     const DxvkDescriptorSetLayoutBinding* bindings) {
-    DxvkPipelineLayoutKey key(DxvkPipelineLayoutType::Merged, flags);
+    DxvkPipelineLayoutKey key(DxvkPipelineLayoutType::BuiltIn, flags);
 
     if (pushDataSize) {
       key.addStages(pushDataStages);
@@ -293,11 +288,19 @@ namespace dxvk {
   VkPipeline DxvkDevice::createBuiltInComputePipeline(
     const DxvkPipelineLayout*             layout,
     const util::DxvkBuiltInShaderStage&   stage) {
+    auto mappingInfo = layout->getMappingInfo();
+
     VkShaderModuleCreateInfo moduleInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
     moduleInfo.codeSize = stage.size;
     moduleInfo.pCode = stage.code;
 
+    if (canUseDescriptorHeap())
+      moduleInfo.pNext = &mappingInfo;
+
     VkPipelineCreateFlags2CreateInfo pipelineFlags = { VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
+
+    if (canUseDescriptorHeap())
+      pipelineFlags.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
 
     if (canUseDescriptorBuffer())
       pipelineFlags.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
@@ -332,6 +335,8 @@ namespace dxvk {
     const util::DxvkBuiltInGraphicsState& state) {
     constexpr size_t MaxStages = 3u;
 
+    auto mappingInfo = layout->getMappingInfo();
+
     // Build shader stage infos
     small_vector<std::pair<VkShaderStageFlagBits, util::DxvkBuiltInShaderStage>, MaxStages> stages;
 
@@ -346,6 +351,9 @@ namespace dxvk {
       info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
       info.codeSize = stages[i].second.size;
       info.pCode = stages[i].second.code;
+
+      if (canUseDescriptorHeap())
+        info.pNext = &mappingInfo;
     }
 
     small_vector<VkPipelineShaderStageCreateInfo, MaxStages> stageInfos;
@@ -361,6 +369,14 @@ namespace dxvk {
 
     // Attachment format infos, useful to set up state
     auto depthFormatInfo = lookupFormatInfo(state.depthFormat);
+
+    // Find highest non-null color attachment
+    uint32_t colorAttachmentCount = 0u;
+
+    for (uint32_t i = 0u; i < MaxNumRenderTargets; i++) {
+      if (state.colorFormats[i])
+        colorAttachmentCount = i + 1u;
+    }
 
     // Default vertex input state
     VkPipelineVertexInputStateCreateInfo viState = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
@@ -413,16 +429,16 @@ namespace dxvk {
     }
 
     // Default blend state, only used if color attachments are present
-    VkPipelineColorBlendAttachmentState cbAttachment = { };
-    cbAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
-                                | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    std::array<VkPipelineColorBlendAttachmentState, MaxNumRenderTargets> cbAttachments = { };
+
+    for (auto& cbAttachment : cbAttachments) {
+      cbAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                                  | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    }
 
     VkPipelineColorBlendStateCreateInfo cbState = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-
-    if (state.colorFormat) {
-      cbState.attachmentCount = 1u;
-      cbState.pAttachments = state.cbAttachment ? state.cbAttachment : &cbAttachment;
-    }
+    cbState.attachmentCount = colorAttachmentCount;
+    cbState.pAttachments = state.cbAttachment ? state.cbAttachment : cbAttachments.data();
 
     // Prepare dynamic states
     small_vector<VkDynamicState, 4> dynamicStates;
@@ -439,9 +455,9 @@ namespace dxvk {
     // Build rendering attachment info
     VkPipelineRenderingCreateInfo renderingInfo = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
 
-    if (state.colorFormat) {
-      renderingInfo.colorAttachmentCount = 1u;
-      renderingInfo.pColorAttachmentFormats = &state.colorFormat;
+    if (colorAttachmentCount) {
+      renderingInfo.colorAttachmentCount = colorAttachmentCount;
+      renderingInfo.pColorAttachmentFormats = state.colorFormats.data();
     }
 
     if (state.depthFormat && (depthFormatInfo->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT))
@@ -451,6 +467,9 @@ namespace dxvk {
       renderingInfo.stencilAttachmentFormat = state.depthFormat;
 
     VkPipelineCreateFlags2CreateInfo pipelineFlags = { VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
+
+    if (canUseDescriptorHeap())
+      pipelineFlags.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
 
     if (canUseDescriptorBuffer())
       pipelineFlags.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
@@ -464,7 +483,7 @@ namespace dxvk {
     pipelineInfo.pRasterizationState = state.rsState ? state.rsState : &rsState;
     pipelineInfo.pMultisampleState = &msState;
     pipelineInfo.pDepthStencilState = state.depthFormat ? (state.dsState ? state.dsState : &dsState) : nullptr;
-    pipelineInfo.pColorBlendState = state.colorFormat ? &cbState : nullptr;
+    pipelineInfo.pColorBlendState = colorAttachmentCount ? &cbState : nullptr;
     pipelineInfo.pDynamicState = &dyState;
     pipelineInfo.layout = layout->getPipelineLayout();
     pipelineInfo.basePipelineIndex = -1;
@@ -567,37 +586,21 @@ namespace dxvk {
   }
 
 
-  Rc<DxvkLatencyTracker> DxvkDevice::createLatencyTracker(
-    const Rc<Presenter>&            presenter) {
-    if (m_options.latencySleep == Tristate::False)
-      return nullptr;
-
-    if (m_options.latencySleep == Tristate::Auto) {
-      if (m_features.nvLowLatency2)
-        return new DxvkReflexLatencyTrackerNv(presenter);
-      else
-        return nullptr;
-    }
-
-    return new DxvkBuiltInLatencyTracker(presenter,
-      m_options.latencyTolerance, m_features.nvLowLatency2);
-  }
-
-
   void DxvkDevice::presentImage(
     const Rc<Presenter>&            presenter,
-    const Rc<DxvkLatencyTracker>&   tracker,
           uint64_t                  frameId,
-          DxvkSubmitStatus*         status) {
+          uint64_t                  latencyFrameId,
+          uint32_t                  rectCount,
+    const VkRectLayerKHR*           rects) {
     DxvkPresentInfo presentInfo = { };
     presentInfo.presenter = presenter;
     presentInfo.frameId = frameId;
+    presentInfo.latencyFrameId = latencyFrameId;
 
-    DxvkLatencyInfo latencyInfo;
-    latencyInfo.tracker = tracker;
-    latencyInfo.frameId = frameId;
+    for (uint32_t i = 0u; i < rectCount; i++)
+      presentInfo.rects.push_back(rects[i]);
 
-    m_submissionQueue.present(presentInfo, latencyInfo, status);
+    m_submissionQueue.present(presentInfo);
     
     std::lock_guard<sync::Spinlock> statLock(m_statLock);
     m_statCounters.addCtr(DxvkStatCounter::QueuePresentCount, 1);
@@ -606,32 +609,24 @@ namespace dxvk {
 
   void DxvkDevice::submitCommandList(
     const Rc<DxvkCommandList>&      commandList,
-    const Rc<DxvkLatencyTracker>&   tracker,
-          uint64_t                  frameId,
-          DxvkSubmitStatus*         status) {
+          uint64_t                  submissionId) {
     DxvkSubmitInfo submitInfo = { };
     submitInfo.cmdList = commandList;
 
-    DxvkLatencyInfo latencyInfo;
-    latencyInfo.tracker = tracker;
-    latencyInfo.frameId = frameId;
-
-    m_submissionQueue.submit(submitInfo, latencyInfo, status);
+    m_submissionQueue.submit(submitInfo, submissionId);
 
     std::lock_guard<sync::Spinlock> statLock(m_statLock);
     m_statCounters.merge(commandList->statCounters());
   }
-  
-  
-  VkResult DxvkDevice::waitForSubmission(DxvkSubmitStatus* status) {
-    VkResult result = status->result.load();
 
-    if (result == VK_NOT_READY) {
-      m_submissionQueue.synchronizeSubmission(status);
-      result = status->result.load();
-    }
 
-    return result;
+  void DxvkDevice::setSubmissionTimeout(uint64_t timeout) {
+    m_submissionQueue.setSubmissionTimeout(timeout);
+  }
+
+  
+  void DxvkDevice::waitForSubmission(uint64_t submissionId) {
+    m_submissionQueue.synchronizeSubmission(submissionId);
   }
 
 
@@ -709,18 +704,27 @@ namespace dxvk {
                   || m_adapter->matchesDriver(VK_DRIVER_ID_MESA_V3DV)
                   || m_adapter->matchesDriver(VK_DRIVER_ID_BROADCOM_PROPRIETARY)
                   || m_adapter->matchesDriver(VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA)
-                  || m_adapter->matchesDriver(VK_DRIVER_ID_IMAGINATION_PROPRIETARY);
+                  || m_adapter->matchesDriver(VK_DRIVER_ID_IMAGINATION_PROPRIETARY)
+                  || m_adapter->matchesDriver(VK_DRIVER_ID_MESA_KOSMICKRISP);
 
     applyTristate(tilerMode, m_options.tilerMode);
     hints.preferRenderPassOps = tilerMode;
+    hints.preferCachedMemory = tilerMode;
 
-    // Honeykrisp does not have native support for secondary command buffers
-    // and would suffer from added CPU overhead, so be less aggressive.
-    // TODO: Enable ANV once mesa issue 12791 is resolved.
-    // RADV has issues on RDNA4 up to version 25.0.1.
-    hints.preferPrimaryCmdBufs = m_adapter->matchesDriver(VK_DRIVER_ID_MESA_HONEYKRISP)
-                              || m_adapter->matchesDriver(VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
-                              || m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV, Version(), Version(25, 0, 2));
+    // Compute-based mip generation has some potential for performance
+    // regressions or driver issues. Just enable it on Nvidia and RADV
+    // (GFX10+) for now, where it is proven to work.
+    hints.preferComputeMipGen = (m_adapter->matchesDriver(VK_DRIVER_ID_NVIDIA_PROPRIETARY_KHR)
+                             || (m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV)
+                              && m_properties.vk13.minSubgroupSize == 32u));
+
+    // On AMD we can expect it to be optimal to simply pass the heap offset
+    // to descriptor memory through as-is to avoid some ALU. Some other
+    // vendors are more sensitive towards knowing descriptor alignment.
+    hints.preferDescriptorByteOffsets = m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV)
+                                     || m_adapter->matchesDriver(VK_DRIVER_ID_AMD_OPEN_SOURCE)
+                                     || m_adapter->matchesDriver(VK_DRIVER_ID_AMD_PROPRIETARY);
+
     return hints;
   }
 
@@ -734,16 +738,11 @@ namespace dxvk {
     m_shaderOptions.minStorageBufferAlignment =
       m_properties.core.properties.limits.minStorageBufferOffsetAlignment;
 
-    m_shaderOptions.maxTessFactor =
-      m_properties.core.properties.limits.maxTessellationGenerationLevel;
-
-    if (m_features.core.features.shaderInt16 && m_features.vk12.shaderFloat16)
+    if (m_features.vk12.shaderFloat16)
       m_shaderOptions.flags.set(DxvkShaderCompileFlag::Supports16BitArithmetic);
 
-    // RADV currently does not emit great code with 16-bit sampler indices
-    if (m_features.core.features.shaderInt16 && m_features.vk11.storagePushConstant16
-     && !m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV))
-      m_shaderOptions.flags.set(DxvkShaderCompileFlag::Supports16BitPushData);
+    if (m_features.vk11.storagePushConstant16 && m_features.vk12.storagePushConstant8)
+      m_shaderOptions.flags.set(DxvkShaderCompileFlag::SupportsSubDwordPushData);
 
     // Need to tag typed storage image loads with the format on some devices
     auto r32Features = getFormatFeatures(VK_FORMAT_R32_SFLOAT).optimal
@@ -753,11 +752,14 @@ namespace dxvk {
     if (!(r32Features & VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT))
       m_shaderOptions.flags.set(DxvkShaderCompileFlag::TypedR32LoadRequiresFormat);
 
-    // Intel's hardware sin/cos is so inaccurate that it causes rendering issues in some games
-    bool lowerSinCos = m_adapter->matchesDriver(VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
-                    || m_adapter->matchesDriver(VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS);
+    // Up to the Intel Xe2 GPU architecture, the hardware sin/cos precision was low
+    // (but spec compliant) close to zero, which causes rendering issues in some games.
+    // Precision close to 0 is significantly improved with Xe3 (arch 30) and newer.
+    bool lowerSinCos =
+        (m_adapter->matchesDriver(VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
+         || m_adapter->matchesDriver(VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS))
+         && (!m_features.intelDeviceInfo || m_properties.intelDeviceInfo.deviceIpVersionArch < 30u);
     applyTristate(lowerSinCos, m_options.lowerSinCos);
-
 
     if (lowerSinCos)
       m_shaderOptions.flags.set(DxvkShaderCompileFlag::LowerSinCos);
@@ -768,6 +770,16 @@ namespace dxvk {
         DxvkShaderCompileFlag::LowerFtoI,
         DxvkShaderCompileFlag::LowerF32toF16);
     }
+
+    // Enable game workarounds
+    if (m_options.zeroShaderScratchMemory)
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::ZeroScratchMemory);
+
+    // On AMD, push constant BDA will not be worse than going through a descriptor
+    if (m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV)
+     || m_adapter->matchesDriver(VK_DRIVER_ID_AMD_OPEN_SOURCE)
+     || m_adapter->matchesDriver(VK_DRIVER_ID_AMD_PROPRIETARY))
+      m_shaderOptions.flags.set(DxvkShaderCompileFlag::LowerInBoundsCbvToBda);
 
     // Converting unsigned integers to float should return an unsigned float,
     // but Nvidia drivers prior to 580 don't agree
@@ -843,6 +855,9 @@ namespace dxvk {
     if (m_features.khrShaderFloatControls2.shaderFloatControls2)
       m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsFloatControls2);
 
+    if (canUseDescriptorHeap())
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsDescriptorHeap);
+
     // Set up resource indexing flags
     if (m_features.core.features.shaderUniformBufferArrayDynamicIndexing &&
         m_features.core.features.shaderSampledImageArrayDynamicIndexing &&
@@ -857,6 +872,22 @@ namespace dxvk {
         m_features.vk12.shaderUniformTexelBufferArrayNonUniformIndexing &&
         m_features.vk12.shaderStorageTexelBufferArrayNonUniformIndexing)
       m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsResourceIndexing);
+
+    // Descriptor heap implicitly also enables resource indexing
+    if (canUseDescriptorHeap())
+      m_shaderOptions.spirv.set(DxvkShaderSpirvFlag::SupportsResourceIndexing);
+  }
+
+
+  void DxvkDevice::logBindingModel() {
+    const char* descriptorModel = "Legacy";
+
+    if (canUseDescriptorHeap())
+      descriptorModel = "Descriptor heap";
+    else if (canUseDescriptorBuffer())
+      descriptorModel = "Descriptor buffer";
+
+    Logger::info(str::format("Binding model: ", descriptorModel));
   }
 
 }

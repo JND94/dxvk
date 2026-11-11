@@ -10,10 +10,8 @@
 
 namespace dxvk {
   
-  DxvkSwapchainBlitter::DxvkSwapchainBlitter(
-    const Rc<DxvkDevice>& device,
-    const Rc<hud::Hud>&   hud)
-  : m_device(device), m_hud(hud),
+  DxvkSwapchainBlitter::DxvkSwapchainBlitter(const Rc<DxvkDevice>& device)
+  : m_device(device),
     m_blitLayout(createBlitPipelineLayout()),
     m_cursorLayout(createCursorPipelineLayout()) {
     this->createSampler();
@@ -33,15 +31,13 @@ namespace dxvk {
 
   void DxvkSwapchainBlitter::present(
     const Rc<DxvkCommandList>&ctx,
+    const Rc<hud::Hud>&       hud,
+          VkClearColorValue   clearColor,
     const Rc<DxvkImageView>&  dstView,
           VkRect2D            dstRect,
     const Rc<DxvkImageView>&  srcView,
           VkRect2D            srcRect) {
     std::unique_lock lock(m_mutex);
-
-    // Update HUD, if we have one
-    if (m_hud)
-      m_hud->update();
 
     // Fix up default present areas if necessary
     if (!dstRect.extent.width || !dstRect.extent.height) {
@@ -67,8 +63,8 @@ namespace dxvk {
     // If we can't do proper blending, render the HUD into a separate image
     bool composite = needsComposition(dstView);
 
-    if (m_hud && composite)
-      renderHudImage(ctx, dstView->mipLevelExtent(0));
+    if (hud && composite)
+      renderHudImage(ctx, hud, dstView->mipLevelExtent(0));
     else
       destroyHudImage();
 
@@ -98,8 +94,10 @@ namespace dxvk {
     attachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     attachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
-    if (srcRect.extent != dstRect.extent)
+    if (dstRect.extent != VkExtent2D { dstExtent.width, dstExtent.height }) {
       attachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      attachmentInfo.clearValue.color = clearColor;
+    }
 
     VkRenderingInfo renderInfo = { VK_STRUCTURE_TYPE_RENDERING_INFO };
     renderInfo.renderArea.offset = { 0u, 0u };
@@ -108,20 +106,20 @@ namespace dxvk {
     renderInfo.colorAttachmentCount = 1;
     renderInfo.pColorAttachments = &attachmentInfo;
 
-    ctx->cmdBeginRendering(&renderInfo);
+    ctx->cmdBeginRendering(DxvkCmdBuffer::ExecBuffer, &renderInfo);
 
     performDraw(ctx, dstView, dstRect,
       srcView, srcRect, composite);
 
     if (!composite) {
-      if (m_hud)
-        m_hud->render(ctx, dstView);
+      if (hud)
+        hud->render(ctx, dstView);
 
       if (m_cursorView)
         renderCursor(ctx, dstView);
     }
 
-    ctx->cmdEndRendering();
+    ctx->cmdEndRendering(DxvkCmdBuffer::ExecBuffer);
 
     barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
     barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
@@ -377,8 +375,9 @@ namespace dxvk {
 
   void DxvkSwapchainBlitter::renderHudImage(
     const Rc<DxvkCommandList>&        ctx,
+    const Rc<hud::Hud>&               hud,
           VkExtent3D                  extent) {
-    if (m_hud->empty())
+    if (hud->empty())
       return;
 
     if (!m_hudImage || m_hudImage->info().extent != extent)
@@ -421,11 +420,11 @@ namespace dxvk {
     renderInfo.colorAttachmentCount = 1;
     renderInfo.pColorAttachments = &attachmentInfo;
 
-    ctx->cmdBeginRendering(&renderInfo);
+    ctx->cmdBeginRendering(DxvkCmdBuffer::ExecBuffer, &renderInfo);
 
-    m_hud->render(ctx, m_hudRtv);
+    hud->render(ctx, m_hudRtv);
 
-    ctx->cmdEndRendering();
+    ctx->cmdEndRendering(DxvkCmdBuffer::ExecBuffer);
 
     // Make image shader-readable
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -483,7 +482,7 @@ namespace dxvk {
     m_hudRtv = m_hudImage->createView(viewInfo);
 
     viewInfo.usage          = VK_IMAGE_USAGE_SAMPLED_BIT;
-    m_hudSrv = m_hudImage->createView(viewInfo);
+    // m_hudSrv = m_hudImage->createView(viewInfo);
   }
 
 
@@ -763,7 +762,7 @@ namespace dxvk {
         : util::DxvkBuiltInShaderStage(dxvk_present_frag_ms, &specInfo);
     }
 
-    state.colorFormat = key.dstFormat;
+    state.colorFormats[0] = key.dstFormat;
     return m_device->createBuiltInGraphicsPipeline(m_blitLayout, state);
   }
 
@@ -818,7 +817,7 @@ namespace dxvk {
     util::DxvkBuiltInGraphicsState state = { };
     state.vs = util::DxvkBuiltInShaderStage(dxvk_cursor_vert, nullptr);
     state.fs = util::DxvkBuiltInShaderStage(dxvk_cursor_frag, &specInfo);
-    state.colorFormat = key.dstFormat;
+    state.colorFormats[0] = key.dstFormat;
     state.iaState = &iaState;
     state.cbAttachment = &cbAttachment;
 

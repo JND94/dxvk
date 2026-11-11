@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dxvk_buffer.h"
 #include "dxvk_image.h"
 #include "dxvk_graphics_state.h"
 #include "dxvk_pipelayout.h"
@@ -26,9 +27,10 @@ namespace dxvk {
    */
   struct DxvkAttachment {
     Rc<DxvkImageView> view = nullptr;
+    Rc<DxvkBufferView> shadow = nullptr;
 
-    bool operator == (const DxvkAttachment& other) const { return view == other.view; }
-    bool operator != (const DxvkAttachment& other) const { return view != other.view; }
+    bool operator == (const DxvkAttachment& other) const { return view == other.view && shadow == other.shadow; }
+    bool operator != (const DxvkAttachment& other) const { return view != other.view || shadow != other.shadow; }
   };
   
   
@@ -58,19 +60,13 @@ namespace dxvk {
 
 
   /**
-   * \brief Render target layouts
-   */
-  struct DxvkRenderTargetLayouts {
-    VkImageLayout color[MaxNumRenderTargets];
-    VkImageLayout depth;
-  };
-
-
-  /**
    * \brief Rendering info
    */
   struct DxvkRenderingInfo {
+    std::array<VkRenderingAttachmentFlagsInfoKHR, MaxNumRenderTargets> colorAttachmentFlags = { };
+    std::array<VkAttachmentFeedbackLoopInfoEXT, MaxNumRenderTargets> colorFeedbackLoop = { };
     std::array<VkRenderingAttachmentInfo, MaxNumRenderTargets> color = { };
+    VkAttachmentFeedbackLoopInfoEXT depthStencilFeedbackLoop = { };
     VkRenderingAttachmentInfo depth = { };
     VkRenderingAttachmentInfo stencil = { };
     VkRenderingInfo rendering = { };
@@ -132,6 +128,18 @@ namespace dxvk {
     }
 
     /**
+     * \brief Queries depth-stencil format
+     *
+     * \param [in] id Target Index
+     * \returns The depth-stencil format
+     */
+    VkFormat getDepthFormat() const {
+      return getDepthTarget().view
+        ? getDepthTarget().view->info().format
+        : VK_FORMAT_UNDEFINED;
+    }
+
+    /**
      * \brief Color target
      *
      * \param [in] id Target Index
@@ -139,6 +147,18 @@ namespace dxvk {
      */
     const DxvkAttachment& getColorTarget(uint32_t id) const {
       return m_renderTargets.color[id];
+    }
+
+    /**
+     * \brief Queries color format
+     *
+     * \param [in] id Target Index
+     * \returns The color target format
+     */
+    VkFormat getColorFormat(uint32_t id) const {
+      return getColorTarget(id).view
+        ? getColorTarget(id).view->info().format
+        : VK_FORMAT_UNDEFINED;
     }
 
     /**

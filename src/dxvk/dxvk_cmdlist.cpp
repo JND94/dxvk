@@ -1,8 +1,16 @@
+#include <algorithm>
 
 #include "dxvk_cmdlist.h"
 #include "dxvk_device.h"
 
 namespace dxvk {
+
+  DxvkDeviceQueue getQueueForCommandBuffer(DxvkDevice* device, DxvkCmdBuffer cmdBuffer) {
+    return cmdBuffer < DxvkCmdBuffer::SdmaBuffer
+      ? device->queues().graphics
+      : device->queues().transfer;
+  }
+
 
   DxvkCommandSubmission::DxvkCommandSubmission() {
 
@@ -51,12 +59,8 @@ namespace dxvk {
 
   VkResult DxvkCommandSubmission::submit(
           DxvkDevice*           device,
-          VkQueue               queue,
-          uint64_t              frameId) {
+          VkQueue               queue) {
     auto vk = device->vkd();
-
-    VkLatencySubmissionPresentIdNV latencyInfo = { VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV };
-    latencyInfo.presentID = frameId;
 
     VkSubmitInfo2 submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
 
@@ -74,9 +78,6 @@ namespace dxvk {
       submitInfo.signalSemaphoreInfoCount = m_semaphoreSignals.size();
       submitInfo.pSignalSemaphoreInfos = m_semaphoreSignals.data();
     }
-
-    if (frameId && device->features().nvLowLatency2)
-      latencyInfo.pNext = std::exchange(submitInfo.pNext, &latencyInfo);
 
     VkResult vr = VK_SUCCESS;
 
@@ -223,7 +224,8 @@ namespace dxvk {
   DxvkCommandList::DxvkCommandList(DxvkDevice* device)
   : m_device        (device),
     m_vkd           (device->vkd()),
-    m_vki           (device->vki()) {
+    m_vki           (device->vki()),
+    m_checkpoints   (device->getCheckpointBuffer()) {
     const auto& graphicsQueue = m_device->queues().graphics;
     const auto& transferQueue = m_device->queues().transfer;
 
@@ -233,6 +235,8 @@ namespace dxvk {
       m_transferPool = new DxvkCommandPool(device, transferQueue.queueFamily);
     else
       m_transferPool = m_graphicsPool;
+
+    resetCheckpoints();
   }
   
   
@@ -243,8 +247,7 @@ namespace dxvk {
   
   VkResult DxvkCommandList::submit(
     const DxvkTimelineSemaphores&       semaphores,
-          DxvkTimelineSemaphoreValues&  timelines,
-          uint64_t                      trackedId) {
+          DxvkTimelineSemaphoreValues&  timelines) {
     // Wait for pending descriptor copies to finish
     m_descriptorSync.synchronize();
 
@@ -306,7 +309,7 @@ namespace dxvk {
         m_commandSubmission.signalSemaphore(semaphores.transfer,
           ++timelines.transfer, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
 
-        if ((status = m_commandSubmission.submit(m_device, transfer.queueHandle, trackedId)))
+        if ((status = m_commandSubmission.submit(m_device, transfer.queueHandle)))
           return status;
 
         m_commandSubmission.waitSemaphore(semaphores.transfer,
@@ -348,7 +351,7 @@ namespace dxvk {
         ++timelines.graphics, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
 
       // Finally, submit all graphics commands of the current submission
-      if ((status = m_commandSubmission.submit(m_device, graphics.queueHandle, trackedId)))
+      if ((status = m_commandSubmission.submit(m_device, graphics.queueHandle)))
         return status;
 
       // If there are WSI semaphores involved, do another submit only
@@ -358,7 +361,7 @@ namespace dxvk {
         m_commandSubmission.signalSemaphore(semaphores.graphics,
           ++timelines.graphics, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
 
-        if ((status = m_commandSubmission.submit(m_device, graphics.queueHandle, trackedId)))
+        if ((status = m_commandSubmission.submit(m_device, graphics.queueHandle)))
           return status;
       }
 
@@ -368,7 +371,7 @@ namespace dxvk {
         m_commandSubmission.waitSemaphore(semaphores.graphics,
           timelines.graphics, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
 
-        if (isLast && (status = m_commandSubmission.submit(m_device, transfer.queueHandle, trackedId)))
+        if (isLast && (status = m_commandSubmission.submit(m_device, transfer.queueHandle)))
           return status;
       }
     }
@@ -390,7 +393,7 @@ namespace dxvk {
     // Record commands to upload descriptors if necessary, and
     // reset the descriptor range to not keep it alive for too
     // long. Descriptor ranges are tracked when bound.
-    if (m_device->canUseDescriptorBuffer()) {
+    if (m_device->canUseDescriptorHeap() || m_device->canUseDescriptorBuffer()) {
       countDescriptorStats(m_descriptorRange, m_descriptorOffset);
 
       m_descriptorRange = nullptr;
@@ -405,8 +408,15 @@ namespace dxvk {
     // For consistency, end all command buffers here,
     // regardless of whether they have been used.
     for (uint32_t i = 0; i < m_cmd.cmdBuffers.size(); i++) {
-      if (m_cmd.cmdBuffers[i])
+      if (m_cmd.cmdBuffers[i]) {
+        if (m_checkpoints) {
+          m_checkpoints->endCommandBuffer(
+            getQueueForCommandBuffer(m_device, DxvkCmdBuffer(i)),
+            m_cmd.cmdBuffers[i], m_checkpointIds[i]);
+        }
+
         endCommandBuffer(m_cmd.cmdBuffers[i]);
+      }
     }
 
     // Reset all command buffer handles
@@ -422,34 +432,33 @@ namespace dxvk {
     bool push = m_cmd.sparseBind || m_cmd.execCommands;
 
     for (uint32_t i = 0; i < m_cmd.cmdBuffers.size(); i++) {
-      DxvkCmdBuffer cmdBuffer = DxvkCmdBuffer(i);
-
-      if (cmdBuffer == DxvkCmdBuffer::ExecBuffer && !m_cmd.execCommands)
-        continue;
-
-      if (m_cmd.cmdBuffers[i]) {
-        endCommandBuffer(m_cmd.cmdBuffers[i]);
-
-        m_cmd.cmdBuffers[i] = cmdBuffer == DxvkCmdBuffer::ExecBuffer
-          ? allocateCommandBuffer(cmdBuffer)
-          : VK_NULL_HANDLE;
-
-        push = true;
-      }
+      // An execution command buffer always exists, even if unused.
+      if (DxvkCmdBuffer(i) != DxvkCmdBuffer::ExecBuffer)
+        push = push || m_cmd.cmdBuffers[i];
     }
 
     if (!push)
       return;
 
+    for (uint32_t i = 0; i < m_cmd.cmdBuffers.size(); i++) {
+      if (m_cmd.cmdBuffers[i])
+        endCommandBuffer(m_cmd.cmdBuffers[i]);
+    }
+
     m_cmdSubmissions.push_back(m_cmd);
 
-    m_cmd.execCommands = VK_FALSE;
-    m_cmd.syncSdma = VK_FALSE;
-    m_cmd.sparseBind = VK_FALSE;
+    m_cmd = DxvkCommandSubmissionInfo();
+    m_cmd.cmdBuffers[uint32_t(DxvkCmdBuffer::ExecBuffer)] = allocateCommandBuffer(DxvkCmdBuffer::ExecBuffer);
   }
 
   
   void DxvkCommandList::reset() {
+    resetCheckpoints();
+
+    // We will re-apply heap bindings first thing in a
+    // new command list, so reset this flag here
+    m_descriptorHeapInvalidated = false;
+
     // Free resources and other objects
     // that are no longer in use
     m_objectTracker.clear();
@@ -491,7 +500,10 @@ namespace dxvk {
     const DxvkDescriptorWrite*          descriptorInfos,
           size_t                        pushDataSize,
     const void*                         pushData) {
-    if (m_device->canUseDescriptorBuffer()) {
+    if (m_device->canUseDescriptorHeap()) {
+      bindResourcesDescriptorHeap(cmdBuffer, layout,
+        descriptorCount, descriptorInfos, pushDataSize, pushData);
+    } else if (m_device->canUseDescriptorBuffer()) {
       bindResourcesDescriptorBuffer(cmdBuffer, layout,
         descriptorCount, descriptorInfos, pushDataSize, pushData);
     } else {
@@ -542,7 +554,8 @@ namespace dxvk {
           } break;
 
           case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-          case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
+          case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+          case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: {
             if (info.descriptor)
               descriptor.image = info.descriptor->legacy.image;
           } break;
@@ -564,10 +577,14 @@ namespace dxvk {
 
       sets.push_back(set);
 
-      this->cmdBindDescriptorSets(cmdBuffer,
-        layout->getBindPoint(),
-        layout->getPipelineLayout(),
-        0u, sets.size(), sets.data());
+      VkBindDescriptorSetsInfo bindInfo = { VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO };
+      bindInfo.stageFlags = layout->getShaderStageMask();
+      bindInfo.layout = layout->getPipelineLayout();
+      bindInfo.firstSet = 0u;
+      bindInfo.descriptorSetCount = sets.size();
+      bindInfo.pDescriptorSets = sets.data();
+
+      this->cmdBindDescriptorSets(cmdBuffer, &bindInfo);
     }
 
     // Update push constants
@@ -578,12 +595,128 @@ namespace dxvk {
       std::memcpy(dataCopy.data(), pushData,
         std::min(dataCopy.size(), pushDataSize));
 
-      this->cmdPushConstants(cmdBuffer,
-        layout->getPipelineLayout(),
-        pushDataBlock.getStageMask(),
-        pushDataBlock.getOffset(),
-        pushDataBlock.getSize(),
-        dataCopy.data());
+      VkPushConstantsInfo pushInfo = { VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO };
+      pushInfo.layout = layout->getPipelineLayout();
+      pushInfo.stageFlags = pushDataBlock.getStageMask();
+      pushInfo.offset = pushDataBlock.getOffset();
+      pushInfo.size = pushDataBlock.getSize();
+      pushInfo.pValues = dataCopy.data();
+
+      this->cmdPushConstants(cmdBuffer, &pushInfo);
+    }
+  }
+
+
+  void DxvkCommandList::bindResourcesDescriptorHeap(
+          DxvkCmdBuffer                 cmdBuffer,
+    const DxvkPipelineLayout*           layout,
+          uint32_t                      descriptorCount,
+    const DxvkDescriptorWrite*          descriptorInfos,
+          size_t                        pushDataSize,
+    const void*                         pushData) {
+    auto setLayout = layout->getDescriptorSetLayout(0u);
+
+    // Whether heaps are valid is command list state, not context state,
+    // to facilitate interactions with external rendering
+    this->ensureDescriptorHeapBinding();
+
+    // For built-in pipelines, the push data layout will have shader-defined
+    // consants first, then a byte offset to the descriptor set, in contrast
+    // to regular pipelines.
+    DxvkPushDataBlock pushDataBlock = layout->getPushData();
+
+    if (pushDataSize && !pushDataBlock.isEmpty()) {
+      VkPushDataInfoEXT pushInfo = { VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT };
+      pushInfo.offset = 0u;
+      pushInfo.data.address = pushData;
+      pushInfo.data.size = pushDataSize;
+
+      this->cmdPushData(cmdBuffer, &pushInfo);
+    }
+
+    if (descriptorCount && setLayout && !setLayout->isEmpty()) {
+      auto vk = m_device->vkd();
+
+      // Assume that a descriptor heap is already active and that
+      // we're not recording into a secondary command buffer.
+      if (!canAllocateDescriptors(layout))
+        createDescriptorRange();
+
+      // Need to pre-allocate arrays with a fixed size so pointers remain valid
+      small_vector<DxvkDescriptor, 8u> buffers(descriptorCount);
+      small_vector<VkHostAddressRangeEXT, 8u> hostRanges(descriptorCount);
+      small_vector<VkDeviceAddressRangeEXT, 8u> bufferRanges(descriptorCount);
+      small_vector<VkResourceDescriptorInfoEXT, 8u> writes(descriptorCount);
+
+      // Populate descriptor arrays with necessary information
+      small_vector<const DxvkDescriptor*, 8u> descriptors;
+      descriptors.reserve(descriptorCount);
+
+      uint32_t writeCount = 0u;
+
+      for (uint32_t i = 0u; i < descriptorCount; i++) {
+        const auto& info = descriptorInfos[i];
+
+        switch (info.descriptorType) {
+          case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+          case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
+            auto& descriptor = buffers[writeCount];
+            descriptors.push_back(&descriptor);
+
+            auto& hostRange = hostRanges[writeCount];
+            hostRange = descriptor.getHostAddressRange();
+
+            auto& bufferRange = bufferRanges[writeCount];
+            bufferRange.address = info.buffer.gpuAddress;
+            bufferRange.size = info.buffer.size;
+
+            auto& write = writes[writeCount];
+            write.sType = VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT;
+            write.type = info.descriptorType;
+            write.data.pAddressRange = &bufferRange;
+
+            writeCount += 1u;
+          } break;
+
+          case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+          case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+          case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+          case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+          case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: {
+            auto descriptor = info.descriptor;
+
+            if (!descriptor)
+              descriptor = m_device->getDescriptorProperties().getNullDescriptor(info.descriptorType);
+
+            descriptors.push_back(descriptor);
+          } break;
+
+          default:
+            Logger::err(str::format("Unhandled descriptor type ", info.descriptorType));
+        }
+      }
+
+      // Write out buffer descriptors
+      if (writeCount) {
+        vk->vkWriteResourceDescriptorsEXT(vk->device(),
+          writeCount, writes.data(), hostRanges.data());
+      }
+
+      // Allocate descriptor storage and update the set
+      auto setLayout = layout->getDescriptorSetLayout(0u);
+      auto storage = allocateDescriptors(setLayout);
+
+      setLayout->update(storage.mapPtr, descriptors.data());
+
+      // Bind the set by updating the appropriate push constant
+      uint32_t setOffset = storage.offset >> layout->getDescriptorOffsetShift();
+
+      VkPushDataInfoEXT pushInfo = { VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT };
+      pushInfo.offset = pushDataBlock.getSize();
+      pushInfo.data.address = &setOffset;
+      pushInfo.data.size = sizeof(setOffset);
+
+      this->cmdPushData(cmdBuffer, &pushInfo);
     }
   }
 
@@ -644,7 +777,8 @@ namespace dxvk {
           case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
           case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
           case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-          case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
+          case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+          case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: {
             auto descriptor = info.descriptor;
 
             if (!descriptor)
@@ -680,12 +814,15 @@ namespace dxvk {
       bufferOffsets[setCount] = storage.offset;
       setCount++;
 
-      cmdSetDescriptorBufferOffsetsEXT(cmdBuffer,
-        layout->getBindPoint(),
-        layout->getPipelineLayout(),
-        0u, setCount,
-        bufferIndices.data(),
-        bufferOffsets.data());
+      VkSetDescriptorBufferOffsetsInfoEXT bindInfo = { VK_STRUCTURE_TYPE_SET_DESCRIPTOR_BUFFER_OFFSETS_INFO_EXT };
+      bindInfo.stageFlags = layout->getShaderStageMask();
+      bindInfo.layout = layout->getPipelineLayout();
+      bindInfo.firstSet = 0u;
+      bindInfo.setCount = setCount;
+      bindInfo.pBufferIndices = bufferIndices.data();
+      bindInfo.pOffsets = bufferOffsets.data();
+
+      cmdSetDescriptorBufferOffsetsEXT(cmdBuffer, &bindInfo);
     }
 
     // Update push constants
@@ -696,12 +833,14 @@ namespace dxvk {
       std::memcpy(dataCopy.data(), pushData,
         std::min(dataCopy.size(), pushDataSize));
 
-      this->cmdPushConstants(cmdBuffer,
-        layout->getPipelineLayout(),
-        pushDataBlock.getStageMask(),
-        pushDataBlock.getOffset(),
-        pushDataBlock.getSize(),
-        dataCopy.data());
+      VkPushConstantsInfo pushInfo = { VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO };
+      pushInfo.layout = layout->getPipelineLayout();
+      pushInfo.stageFlags = pushDataBlock.getStageMask();
+      pushInfo.offset = pushDataBlock.getOffset();
+      pushInfo.size = pushDataBlock.getSize();
+      pushInfo.pValues = dataCopy.data();
+
+      this->cmdPushConstants(cmdBuffer, &pushInfo);
     }
   }
 
@@ -716,13 +855,17 @@ namespace dxvk {
     m_descriptorRange = m_descriptorHeap->allocRange();
     auto newBaseAddress = m_descriptorRange->getHeapInfo().gpuAddress;
 
-    if (newBaseAddress != oldBaseAddress) {
+    if (unlikely(newBaseAddress != oldBaseAddress)) {
       if (m_execBuffer) {
+        // Can't rebind heap on secondary
         m_descriptorRange = nullptr;
         return false;
       }
 
-      rebindDescriptorBuffers();
+      if (m_device->canUseDescriptorHeap())
+        rebindResourceHeap();
+      else if (m_device->canUseDescriptorBuffer())
+        rebindDescriptorBuffers();
     }
 
     m_descriptorOffset = m_descriptorRange->getAllocationOffset();
@@ -733,7 +876,21 @@ namespace dxvk {
 
 
   void DxvkCommandList::beginSecondaryCommandBuffer(
-    const VkCommandBufferInheritanceInfo& inheritanceInfo) {
+          VkCommandBufferInheritanceInfo inheritanceInfo) {
+    VkCommandBufferInheritanceDescriptorHeapInfoEXT heapInheritance = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_DESCRIPTOR_HEAP_INFO_EXT };
+
+    VkBindHeapInfoEXT samplerHeap = { };
+    VkBindHeapInfoEXT resourceHeap = { };
+
+    if (m_device->canUseDescriptorHeap()) {
+      samplerHeap = getHeapBindInfo(m_device->getSamplerDescriptorHeap());
+      resourceHeap = getHeapBindInfo(m_descriptorRange->getHeapInfo());
+
+      heapInheritance.pNext = std::exchange(inheritanceInfo.pNext, &heapInheritance);
+      heapInheritance.pSamplerHeapBindInfo = &samplerHeap;
+      heapInheritance.pResourceHeapBindInfo = &resourceHeap;
+    }
+
     VkCommandBuffer secondary = m_graphicsPool->getSecondaryCommandBuffer(inheritanceInfo);
 
     if (m_device->canUseDescriptorBuffer())
@@ -770,13 +927,35 @@ namespace dxvk {
 
   void DxvkCommandList::setDescriptorHeap(
           Rc<DxvkResourceDescriptorHeap> heap) {
+    // External rendering reapplies state, but we
+    // really want to avoid that for heap binding
+    if (m_descriptorHeap == heap)
+      return;
+
     m_descriptorHeap = std::move(heap);
     m_descriptorRange = m_descriptorHeap->getRange();
     m_descriptorOffset = m_descriptorRange->getAllocationOffset();
 
-    rebindDescriptorBuffers();
+    if (m_device->canUseDescriptorHeap())
+      rebindResourceHeap();
+    else if (m_device->canUseDescriptorBuffer())
+      rebindDescriptorBuffers();
 
     track(m_descriptorRange);
+  }
+
+
+  void DxvkCommandList::rebindSamplerHeap() {
+    // Secondary command buffer must not be active when this gets called
+    for (uint32_t i = uint32_t(DxvkCmdBuffer::ExecBuffer); i <= uint32_t(DxvkCmdBuffer::InitBarriers); i++)
+      bindSamplerHeap(m_cmd.cmdBuffers[i]);
+  }
+
+
+  void DxvkCommandList::rebindResourceHeap() {
+    // Secondary command buffer must not be active when this gets called
+    for (uint32_t i = uint32_t(DxvkCmdBuffer::ExecBuffer); i <= uint32_t(DxvkCmdBuffer::InitBarriers); i++)
+      bindResourceHeap(m_cmd.cmdBuffers[i]);
   }
 
 
@@ -784,6 +963,28 @@ namespace dxvk {
     // Secondary command buffer must not be active when this gets called
     for (uint32_t i = uint32_t(DxvkCmdBuffer::ExecBuffer); i <= uint32_t(DxvkCmdBuffer::InitBuffer); i++)
       bindDescriptorBuffers(m_cmd.cmdBuffers[i]);
+  }
+
+
+  void DxvkCommandList::bindSamplerHeap(VkCommandBuffer cmdBuffer) {
+    auto vk = m_device->vkd();
+
+    if (!cmdBuffer)
+      return;
+
+    VkBindHeapInfoEXT bindInfo = getHeapBindInfo(m_device->getSamplerDescriptorHeap());
+    vk->vkCmdBindSamplerHeapEXT(cmdBuffer, &bindInfo);
+  }
+
+
+  void DxvkCommandList::bindResourceHeap(VkCommandBuffer cmdBuffer) {
+    auto vk = m_device->vkd();
+
+    if (!cmdBuffer || !m_descriptorRange)
+      return;
+
+    VkBindHeapInfoEXT bindInfo = getHeapBindInfo(m_descriptorRange->getHeapInfo());
+    vk->vkCmdBindResourceHeapEXT(cmdBuffer, &bindInfo);
   }
 
 
@@ -828,6 +1029,11 @@ namespace dxvk {
       ? m_transferPool->getCommandBuffer(type)
       : m_graphicsPool->getCommandBuffer(type);
 
+    if (type <= DxvkCmdBuffer::InitBarriers && m_device->canUseDescriptorHeap()) {
+      bindSamplerHeap(cmdBuffer);
+      bindResourceHeap(cmdBuffer);
+    }
+
     if (type <= DxvkCmdBuffer::InitBuffer && m_device->canUseDescriptorBuffer())
       bindDescriptorBuffers(cmdBuffer);
 
@@ -842,6 +1048,85 @@ namespace dxvk {
       VkDeviceSize dataSize = range->getAllocationOffset() - baseOffset;
       addStatCtr(DxvkStatCounter::DescriptorHeapUsed, dataSize);
     }
+  }
+
+
+  void DxvkCommandList::resetCheckpoints() {
+    std::fill(m_checkpointIds.begin(), m_checkpointIds.end(), -1);
+  }
+
+
+  void DxvkCommandList::debugMarker(
+          DxvkCmdBuffer                 cmdBuffer,
+    const char*                         text) {
+    if (m_checkpoints) {
+      auto cmdIndex = uint32_t(cmdBuffer);
+
+      m_checkpointIds.at(cmdIndex) = m_checkpoints->addCheckpoint(
+        getQueueForCommandBuffer(m_device, cmdBuffer), getCmdBuffer(cmdBuffer),
+        m_checkpointIds.at(cmdIndex), text);
+    }
+  }
+
+
+  void DxvkCommandList::debugDispatch(
+          DxvkCmdBuffer                 cmdBuffer,
+    const char*                         text,
+          uint32_t                      x,
+          uint32_t                      y,
+          uint32_t                      z) {
+    debugMarker(cmdBuffer, str::format(text, " (", x, ", ", y, ", ", z, ")").c_str());
+  }
+
+
+  void DxvkCommandList::debugDraw(
+          DxvkCmdBuffer                 cmdBuffer,
+    const char*                         text,
+          uint32_t                      count,
+          uint32_t                      instances) {
+    debugMarker(cmdBuffer, str::format(text, " (", count, ", ", instances, ")").c_str());
+  }
+
+
+  void DxvkCommandList::debugDrawMulti(
+          DxvkCmdBuffer                 cmdBuffer,
+    const char*                         text,
+          uint32_t                      count) {
+    debugMarker(cmdBuffer, str::format(text, " (", count, ")").c_str());
+  }
+
+
+  void DxvkCommandList::debugDrawIndirect(
+          DxvkCmdBuffer                 cmdBuffer,
+    const char*                         text,
+          uint32_t                      count,
+          uint32_t                      stride) {
+    debugMarker(cmdBuffer, str::format(text, " (", count, ", ", stride, ")").c_str());
+  }
+
+
+  void DxvkCommandList::debugBarrier(
+          DxvkCmdBuffer                 cmdBuffer,
+    const VkDependencyInfo*             depInfo) {
+    VkMemoryBarrier2 barrier = {};
+
+    for (uint32_t i = 0u; i < depInfo->memoryBarrierCount; i++) {
+      barrier.srcStageMask |= depInfo->pMemoryBarriers[i].srcStageMask;
+      barrier.srcAccessMask |= depInfo->pMemoryBarriers[i].srcAccessMask;
+      barrier.dstStageMask |= depInfo->pMemoryBarriers[i].dstStageMask;
+      barrier.dstAccessMask |= depInfo->pMemoryBarriers[i].dstAccessMask;
+    }
+
+    for (uint32_t i = 0u; i < depInfo->imageMemoryBarrierCount; i++) {
+      barrier.srcStageMask |= depInfo->pImageMemoryBarriers[i].srcStageMask;
+      barrier.srcAccessMask |= depInfo->pImageMemoryBarriers[i].srcAccessMask;
+      barrier.dstStageMask |= depInfo->pImageMemoryBarriers[i].dstStageMask;
+      barrier.dstAccessMask |= depInfo->pImageMemoryBarriers[i].dstAccessMask;
+    }
+
+    debugMarker(cmdBuffer, str::format("Barrier (", depInfo->memoryBarrierCount, ", ", depInfo->imageMemoryBarrierCount, "): ",
+      "0x", std::hex, barrier.srcStageMask, ":0x", std::hex, barrier.srcAccessMask, " -> ",
+      "0x", std::hex, barrier.dstStageMask, ":0x", std::hex, barrier.dstAccessMask).c_str());
   }
 
 }

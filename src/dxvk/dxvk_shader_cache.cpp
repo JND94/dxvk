@@ -59,10 +59,11 @@ namespace dxvk {
     if (!shader) {
       Logger::warn(str::format("Failed to load cached shader ", name));
 
+      m_lut.clear();
       if (!openWriteOnlyLocked())
         Logger::warn(str::format("Failed to re-initialize shader cache ", name));
 
-      m_status.store(Status::OpenWriteOnly, std::memory_order_release);
+      m_status.store(Status::OpenWriteOnly);
     }
 
     return shader;
@@ -70,7 +71,7 @@ namespace dxvk {
 
 
   void DxvkShaderCache::addShader(Rc<DxvkIrShader> shader) {
-    if (!ensureStatus(Status::OpenReadWrite))
+    if (!ensureStatus(Status::OpenWriteOnly))
       return;
 
     LutKey k = { };
@@ -89,7 +90,7 @@ namespace dxvk {
 
 
   bool DxvkShaderCache::ensureStatus(Status status) {
-    auto currentStatus = m_status.load(std::memory_order_acquire);
+    auto currentStatus = m_status.load();
 
     if (currentStatus == Status::Uninitialized)
       currentStatus = initialize();
@@ -100,14 +101,14 @@ namespace dxvk {
 
   DxvkShaderCache::Status DxvkShaderCache::initialize() {
     std::unique_lock lock(m_fileMutex);
-    auto status = m_status.load(std::memory_order_relaxed);
+    auto status = m_status.load();
 
     if (status != Status::Uninitialized)
       return status;
 
     status = tryInitializeLocked();
 
-    m_status.store(status, std::memory_order_release);
+    m_status.store(status);
     return status;
   }
 
@@ -124,7 +125,7 @@ namespace dxvk {
     }
 
     if (openWriteOnlyLocked())
-      return Status::OpenReadWrite;
+      return Status::OpenWriteOnly;
 
     return Status::CacheDisabled;
   }
@@ -227,6 +228,21 @@ namespace dxvk {
       m_lut.insert_or_assign(k, e);
     }
 
+    auto cacheSize = m_binFile.size();;
+
+    std::stringstream message;
+    message << "Cache: " << m_lut.size() << " shaders (";
+
+    if (cacheSize >= (1ull << 20)) {
+      auto mib = (10ull * cacheSize) >> 20;
+      message << (mib / 10ull) << "." << (mib % 10ull) << " MB";
+    } else {
+      message << (cacheSize >> 10u) << " kB";
+    }
+
+    message << ")";
+
+    Logger::info(message.str());
     return true;
   }
 
@@ -315,10 +331,16 @@ namespace dxvk {
     for (uint32_t i = 0u; i < varCount; i++) {
       DxvkShaderIoVar var = { };
 
-      if (!read(stream, offset, var))
+      if (!read(stream, offset, var.builtIn)
+       || !read(stream, offset, var.location)
+       || !read(stream, offset, var.componentIndex)
+       || !read(stream, offset, var.componentCount)
+       || !read(stream, offset, var.isPatchConstant)
+       || !read(stream, offset, var.semanticIndex)
+       || !readString(stream, offset, var.semanticName))
         return false;
 
-      io.add(var);
+      io.add(std::move(var));
     }
 
     return true;
@@ -397,6 +419,21 @@ namespace dxvk {
       layout.addSamplerHeap(binding);
     }
 
+    // Read spec data mappings
+    uint32_t specDataCount = 0u;
+
+    if (!read(stream, offset, specDataCount))
+      return false;
+
+    for (uint32_t i = 0u; i < specDataCount; i++) {
+      DxvkShaderBinding binding = { };
+
+      if (!read(stream, offset, binding))
+        return false;
+
+      layout.addSpecDataBuffer(binding);
+    }
+
     return true;
   }
 
@@ -436,7 +473,7 @@ namespace dxvk {
 
 
   void DxvkShaderCache::runWriter() {
-    small_vector<Rc<DxvkIrShader>, 128u> localQueue;
+    small_vector<Rc<DxvkIrShader>, 32u> localQueue;
 
     env::setThreadName("dxvk-cache");
 
@@ -500,6 +537,11 @@ namespace dxvk {
     for (size_t i = 0u; i < layout.getSamplerHeapBindingCount(); i++)
       status = status && write(stream, layout.getSamplerHeapBinding(i));
 
+    status = status && write(stream, uint32_t(layout.getSpecDataBindingCount()));
+
+    for (size_t i = 0u; i < layout.getSpecDataBindingCount(); i++)
+      status = status && write(stream, layout.getSpecDataBinding(i));
+
     return status;
   }
 
@@ -507,8 +549,17 @@ namespace dxvk {
   bool DxvkShaderCache::writeShaderIo(util::File& stream, const DxvkShaderIo& io) {
     bool status = write(stream, uint8_t(io.getVarCount()));
 
-    for (uint32_t i = 0u; i < io.getVarCount(); i++)
-      status = status && write(stream, io.getVar(i));
+    for (uint32_t i = 0u; i < io.getVarCount(); i++) {
+      const auto& var = io.getVar(i);
+
+      status = status && write(stream, var.builtIn)
+                      && write(stream, var.location)
+                      && write(stream, var.componentIndex)
+                      && write(stream, var.componentCount)
+                      && write(stream, var.isPatchConstant)
+                      && write(stream, var.semanticIndex)
+                      && writeString(stream, var.semanticName);
+    }
 
     return status;
   }
@@ -618,11 +669,31 @@ namespace dxvk {
 
 
   Rc<DxvkShaderCache> DxvkShaderCache::getInstance() {
-    std::lock_guard lock(s_instance.mutex);
+    std::unique_lock lock(s_instance.mutex);
 
-    if (!s_instance.instance)
-      s_instance.instance = new DxvkShaderCache();
+    while (s_instance.instance) {
+      auto useCount = s_instance.instance->m_useCount.load();
 
+      while (useCount) {
+        // Try to acquire reference from a non-zero ref count to
+        // ensure the object doesn't get destroyed in the meantime
+        if (s_instance.instance->m_useCount.compare_exchange_strong(useCount, useCount + 1u))
+          return Rc<DxvkShaderCache>::unsafeCreate(s_instance.instance);
+      }
+
+      // If the ref count is zero, don't try to revive the object to avoid
+      // weird data races. Instead, wait for the object to get torn down
+      // and potentially recreated by another thread.
+      // Can't compare the pointers directly since a new cache might get
+      // the exact same pointer.
+      s_instance.cond.wait(lock, [&, cVersion = s_instance.version] {
+        return s_instance.version != cVersion;
+      });
+    }
+
+    s_instance.instance = new DxvkShaderCache();
+    s_instance.version += 1u;
+    s_instance.cond.notify_one();
     return s_instance.instance;
   }
 
@@ -630,15 +701,15 @@ namespace dxvk {
   void DxvkShaderCache::freeInstance() {
     std::lock_guard lock(s_instance.mutex);
 
-    // The ref count can only be incremented from 0 to 1 inside a locked
-    // context, so this check is safe. Don't destroy the object if another
-    // thread has essentially revived it.
-    if (m_useCount.load(std::memory_order_relaxed) || s_instance.instance != this) {
-      if (s_instance.instance == this)
-        s_instance.instance = nullptr;
-
-      delete this;
+    if (s_instance.instance == this) {
+      s_instance.instance = nullptr;
+      s_instance.version += 1u;
+      s_instance.cond.notify_one();
     }
+
+    // Keep lock, we want to ensure all files are unlocked before
+    // any other thread can recreate the shader cache.
+    delete this;
   }
 
 

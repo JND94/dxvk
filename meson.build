@@ -1,4 +1,4 @@
-project('dxvk', ['c', 'cpp'], version : '2.7.1', meson_version : '>= 0.58', default_options : [ 'cpp_std=c++17', 'b_vscrt=static_from_buildtype', 'warning_level=2' ])
+project('dxvk', ['c', 'cpp'], version : '3.1.1', meson_version : '>= 0.58', default_options : [ 'cpp_std=c++17', 'b_vscrt=static_from_buildtype', 'warning_level=2' ])
 
 pkg = import('pkgconfig')
 cpu_family = target_machine.cpu_family()
@@ -48,12 +48,9 @@ elif not cpp.check_header('spirv/unified1/spirv.hpp')
   error('Missing SPIRV-Headers')
 endif
 
-dep_displayinfo = dependency(
-  'libdisplay-info',
-  version: ['>= 0.0.0', '< 0.2.0'],
-  fallback: ['libdisplay-info', 'di_dep'],
-  default_options: ['default_library=static'],
-)
+dep_displayinfo = dependency('libdisplay-info',
+  fallback:         ['libdisplay-info', 'di_dep'],
+  default_options:  ['default_library=static', 'pnp-ids=auto', 'tools=disabled'])
 
 if platform == 'windows'
   dxvk_so_version = {'name_prefix': ''}
@@ -72,6 +69,15 @@ if platform == 'windows'
       # work properly as well as avoiding a memcpy from the Wine loader.
       '-Wl,--file-alignment=4096',
     ]
+
+    # Follow PE standards with 8 character name sections, some software that
+    # inspects our DLLs may otherwise crash. For dwarf2 symbols to work we
+    # need to keep the mingw defaults.
+    if not get_option('debug')
+      link_args += [
+        '-Wl,--disable-long-section-names',
+      ]
+    endif
 
     # Wine's built-in back traces only work with dwarf4 symbols
     if get_option('debug')
@@ -107,6 +113,7 @@ if platform == 'windows'
   lib_d3d11   = cpp.find_library('d3d11')
   lib_dxgi    = cpp.find_library('dxgi')
   lib_gdi32   = cpp.find_library('gdi32')
+  lib_version = cpp.find_library('version')
 
   if dxvk_is_msvc
     res_ext = '.res'
@@ -150,7 +157,7 @@ else
 
   lib_sdl3 = dependency('sdl3', required: get_option('native_sdl3'))
   lib_sdl2 = dependency('sdl2', required: get_option('native_sdl2'))
-  lib_glfw = dependency('glfw', required: get_option('native_glfw'))
+  lib_glfw = dependency('glfw3', required: get_option('native_glfw'))
   if lib_sdl3.found()
     compiler_args += ['-DDXVK_WSI_SDL3']
   endif

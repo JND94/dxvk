@@ -331,8 +331,9 @@ namespace dxvk {
     
     D3DRESOURCETYPE textureType = params->Type == D3DRTYPE_SURFACE ? D3DRTYPE_TEXTURE : params->Type;
 
-    if (FAILED(D3D9CommonTexture::NormalizeTextureProperties(m_device, textureType, &desc)))
-      return D3DERR_INVALIDCALL;
+    HRESULT hr = D3D9CommonTexture::NormalizeTextureProperties(m_device, textureType, &desc);
+    if (FAILED(hr))
+      return hr;
 
     switch (params->Type) {
       case D3DRTYPE_SURFACE:
@@ -357,7 +358,8 @@ namespace dxvk {
           const D3D9_COMMON_TEXTURE_DESC& desc,
           IDirect3DResource9**            ppResult) {
     try {
-      const Com<ResourceType> texture = new ResourceType(m_device, &desc, m_device->IsExtended());
+      const bool isExtended = m_device->IsD3DCompatibile(D3DCompatibility::D3D9Ex);
+      const Com<ResourceType> texture = new ResourceType(m_device, &desc, isExtended);
       m_device->m_initializer->InitTexture(texture->GetCommonTexture());
       *ppResult = texture.ref();
 

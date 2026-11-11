@@ -9,8 +9,6 @@
 #include "dxvk_shader_io.h"
 
 #include "../spirv/spirv_code_buffer.h"
-#include "../spirv/spirv_compression.h"
-#include "../spirv/spirv_module.h"
 
 namespace dxvk {
   
@@ -41,9 +39,9 @@ namespace dxvk {
     /// Whether the device supports 16-bit int and float
     /// arithmetic. Effectively enables min16 lowering.
     Supports16BitArithmetic     = 5u,
-    /// Whether 16-bit push data is supported. Used to
-    /// pack sampler indices in the binding model
-    Supports16BitPushData       = 6u,
+    /// Whether 16-bit and 8-bit push data is supported.
+    /// Used to pack sampler indices in the binding model.
+    SupportsSubDwordPushData    = 6u,
     /// Whether to lower unsigned int to float conversions.
     /// Needed to work around an Nvidia driver bug.
     LowerItoF                   = 7u,
@@ -61,6 +59,10 @@ namespace dxvk {
     /// constant buffer. The register space and index for this
     /// buffer are defined in the compile options.
     LowerConstantArrays         = 11u,
+    /// Whether to enable semantic-based I/O interface matching
+    SemanticIo                  = 12u,
+    /// Whether to explicitly use BDA for fully-bound constant buffers.
+    LowerInBoundsCbvToBda       = 13u,
   };
 
   using DxvkShaderCompileFlags = Flags<DxvkShaderCompileFlag>;
@@ -110,6 +112,10 @@ namespace dxvk {
     /// Whether dynamic non-uniform resource indexing is
     /// supported. Only applies to typed resources.
     SupportsResourceIndexing    = 20u,
+    /// Whether descriptor heap is used as the binding model.
+    SupportsDescriptorHeap      = 21u,
+    /// Whether scratch memory should be zeroed.
+    ZeroScratchMemory           = 22u,
   };
 
   using DxvkShaderSpirvFlags = Flags<DxvkShaderSpirvFlag>;
@@ -133,15 +139,12 @@ namespace dxvk {
     /// bindigs beyond this will be lowered to a storage buffer.
     /// Negative numbers impose no limit on the number of buffers.
     int32_t maxUniformBufferCount = -1;
-    /// Maximum tessellation factor. If 0, tessellation factors
-    /// will not be clamped beyond what is set in the shader.
-    uint8_t maxTessFactor = 0u;
-    /// Global push data offset for rasterizer sample count
-    uint8_t sampleCountPushDataOffset = 0u;
+    /// Global push data offset for emulated built-ins
+    uint32_t builtInPushDataOffset = 0u;
     /// Minimum required storage buffer alignment. Buffers
     /// with a smaller guaranteed alignment must be demoted
     /// to typed buffers.
-    uint16_t minStorageBufferAlignment = 0u;
+    uint32_t minStorageBufferAlignment = 0u;
   };
 
 
@@ -155,12 +158,15 @@ namespace dxvk {
     HasSampleRateShading,
     HasTransformFeedback,
     ExportsPosition,
+    ExportsLayer,
+    ExportsViewport,
     ExportsStencilRef,
-    ExportsViewportIndexLayerFromVertexStage,
     ExportsSampleMask,
+    UsesSampleMask,
     UsesFragmentCoverage,
     UsesSparseResidency,
     TessellationPoints,
+    SemanticIo,
   };
 
   using DxvkShaderFlags = Flags<DxvkShaderFlag>;
@@ -200,6 +206,8 @@ namespace dxvk {
   struct DxvkShaderLinkage {
     bool fsDualSrcBlend  = false;
     bool fsFlatShading   = false;
+    bool sampleLocations = false;
+    bool semanticIo      = false;
 
     VkPrimitiveTopology inputTopology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
 
@@ -231,11 +239,11 @@ namespace dxvk {
     virtual ~DxvkShader();
 
     force_inline void incRef() {
-      m_refCount.fetch_add(1u, std::memory_order_acquire);
+      m_refCount.fetch_add(1u);
     }
 
     force_inline void decRef() {
-      if (!(m_refCount.fetch_sub(1u, std::memory_order_acquire) - 1u))
+      if (!(m_refCount.fetch_sub(1u) - 1u))
         delete this;
     }
 
@@ -375,7 +383,7 @@ namespace dxvk {
     
   public:
 
-    DxvkShaderStageInfo(const DxvkDevice* device);
+    DxvkShaderStageInfo(const DxvkDevice* device, const DxvkPipelineLayout* layout);
 
     DxvkShaderStageInfo             (DxvkShaderStageInfo&& other) = delete;
     DxvkShaderStageInfo& operator = (DxvkShaderStageInfo&& other) = delete;
@@ -401,24 +409,24 @@ namespace dxvk {
     /**
      * \brief Adds a shader stage with specialization info
      *
-     * \param [in] stage Shader stage
+     * \param [in] metadata Shader metadata
      * \param [in] code SPIR-V code
      * \param [in] specinfo Specialization info
      */
     void addStage(
-            VkShaderStageFlagBits   stage,
+      const DxvkShaderMetadata&     metadata,
             SpirvCodeBuffer&&       code,
       const VkSpecializationInfo*   specInfo);
 
     /**
      * \brief Adds stage using a module identifier
      *
-     * \param [in] stage Shader stage
+     * \param [in] metadata Shader metadata
      * \param [in] identifier Shader module identifier
      * \param [in] specinfo Specialization info
      */
     void addStage(
-            VkShaderStageFlagBits   stage,
+      const DxvkShaderMetadata&     metadata,
       const VkShaderModuleIdentifierEXT& identifier,
       const VkSpecializationInfo*   specInfo);
 
@@ -435,6 +443,9 @@ namespace dxvk {
       ShaderModuleIdentifier    moduleIdentifier;
       VkShaderModuleCreateInfo  moduleInfo;
     };
+
+    VkShaderDescriptorSetAndBindingMappingInfoEXT   m_mapping = { };
+    void*                                           m_next = nullptr;
 
     std::array<SpirvCodeBuffer,                 5>  m_codeBuffers;
     std::array<ShaderModuleInfo,                5>  m_moduleInfos = { };
@@ -655,6 +666,9 @@ namespace dxvk {
     SpirvCodeBuffer getShaderCode(
             VkShaderStageFlagBits         stage) const;
 
+    DxvkShaderMetadata getShaderMetadata(
+            VkShaderStageFlagBits         stage) const;
+
     void generateModuleIdentifierLocked(
             VkShaderModuleIdentifierEXT*  identifier,
       const SpirvCodeBuffer&              spirvCode);
@@ -676,6 +690,8 @@ namespace dxvk {
     bool canCreatePipelineLibraryForShader(DxvkShader& shader, bool needsPosition) const;
 
     bool canUsePipelineCacheControl() const;
+
+    const DxvkPipelineLayout* getPipelineLibraryLayout() const;
 
   };
   

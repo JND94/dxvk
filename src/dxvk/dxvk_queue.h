@@ -4,26 +4,17 @@
 #include <mutex>
 #include <queue>
 
+#include "../util/sync/sync_signal.h"
+
 #include "../util/thread.h"
 
 #include "dxvk_cmdlist.h"
-#include "dxvk_latency.h"
 #include "dxvk_presenter.h"
 
 namespace dxvk {
   
   class DxvkDevice;
-
-  /**
-   * \brief Submission status
-   * 
-   * Stores the result of a queue
-   * submission or a present call.
-   */
-  struct DxvkSubmitStatus {
-    std::atomic<VkResult> result = { VK_SUCCESS };
-  };
-
+  class DxvkCheckpointBuffer;
 
   /**
    * \brief Queue submission info
@@ -43,20 +34,10 @@ namespace dxvk {
    * a swap chain image on the device.
    */
   struct DxvkPresentInfo {
-    Rc<Presenter>       presenter;
-    uint64_t            frameId;
-  };
-
-
-  /**
-   * \brief Latency info
-   *
-   * Optionally stores a latency tracker
-   * and the associated frame ID.
-   */
-  struct DxvkLatencyInfo {
-    Rc<DxvkLatencyTracker>  tracker;
-    uint64_t                frameId = 0;
+    Rc<Presenter> presenter = nullptr;
+    uint64_t frameId        = 0u;
+    uint64_t latencyFrameId = 0u;
+    small_vector<VkRectLayerKHR, 4u> rects;
   };
 
 
@@ -64,11 +45,9 @@ namespace dxvk {
    * \brief Submission queue entry
    */
   struct DxvkSubmitEntry {
-    VkResult            result;
-    DxvkSubmitStatus*   status;
+    uint64_t            timeline = 0u;
     DxvkSubmitInfo      submit;
     DxvkPresentInfo     present;
-    DxvkLatencyInfo     latency;
     DxvkTimelineSemaphoreValues timelines;
   };
 
@@ -116,13 +95,11 @@ namespace dxvk {
      * dedicated submission thread. Use this to take
      * the submission overhead off the calling thread.
      * \param [in] submitInfo Submission parameters
-     * \param [in] latencyInfo Latency tracker info
      * \param [out] status Submission feedback
      */
     void submit(
             DxvkSubmitInfo      submitInfo,
-            DxvkLatencyInfo     latencyInfo,
-            DxvkSubmitStatus*   status);
+            uint64_t            submissionId);
     
     /**
      * \brief Presents an image synchronously
@@ -131,23 +108,18 @@ namespace dxvk {
      * and then presents the current swap chain image
      * of the presenter. May stall the calling thread.
      * \param [in] present Present parameters
-     * \param [in] latencyInfo Latency tracker info
      * \param [out] status Submission feedback
      */
     void present(
-            DxvkPresentInfo     presentInfo,
-            DxvkLatencyInfo     latencyInfo,
-            DxvkSubmitStatus*   status);
+            DxvkPresentInfo     presentInfo);
     
     /**
      * \brief Synchronizes with one queue submission
      * 
-     * Waits for the result of the given submission
-     * or present operation to become available.
-     * \param [in,out] status Submission status
+     * Waits for the given submission to be performed.
+     * \param [in] uint64_t submissionId
      */
-    void synchronizeSubmission(
-            DxvkSubmitStatus*   status);
+    void synchronizeSubmission(uint64_t submissionId);
     
     /**
      * \brief Synchronizes with queue submissions
@@ -191,10 +163,19 @@ namespace dxvk {
      * queue used for command buffer submission.
      */
     void unlockDeviceQueue();
+
+    /**
+     * \brief Sets submission timeout used to detect GPU hangs
+     *
+     * \param [in] timeout Desired timeout, in nanoseconds.
+     *    Pass -1 to disable timeout-based hang detection.
+     */
+    void setSubmissionTimeout(uint64_t timeout);
     
   private:
 
     DxvkDevice*                 m_device;
+    DxvkCheckpointBuffer*       m_checkpoints = nullptr;
     DxvkQueueCallback           m_callback;
 
     DxvkTimelineSemaphores      m_semaphores;
@@ -217,6 +198,10 @@ namespace dxvk {
 
     dxvk::thread                m_submitThread;
     dxvk::thread                m_finishThread;
+
+    sync::Fence                 m_submitTimeline;
+
+    uint64_t                    m_submissionTimeout = 5'000'000'000ull;
 
     void submitCmdLists();
 
